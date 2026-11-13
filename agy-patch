@@ -1,0 +1,1113 @@
+#!/usr/bin/env python3
+"""Patch the Antigravity CLI (`agy`) for 1M-class context windows.
+
+The tool rewrites a fixed, version-checked set of code sites in the Go
+binary (Linux x86-64): it disables automatic checkpointing/compaction,
+removes the 256k token clamp, raises the built-in context-window values to
+the fixed UI maximum (983040 tokens) and makes the model picker offer
+context-window options for every model.
+
+It never edits settings files and never uses the network.  All edits are
+exact same-length byte replacements inside named Go functions located via
+the Go pclntab and the moduledata relocations of the ELF image.  Unknown or
+ambiguous binaries abort before anything is written.
+
+Tested against agy 1.5.8 and 1.5.7 (the 1.5.7 tables exist for rollback).
+"""
+
+import argparse
+import hashlib
+import json
+import mmap
+import os
+import shutil
+import stat
+import struct
+import sys
+import tempfile
+import time
+import traceback
+
+KNOWN_BUILDS = {
+    "9db59b6371107b939befa9c507c0a24989fda974e75d81d8529f3689ef7322e5": "1.5.8",
+    "5df525a2d6908989c57b897723caea66e00d7c4d2e24411f91ad306989574642": "1.5.7",
+}
+
+CHUNK = 1 << 20
+
+ELF_MAGIC = b"\x7fELF"
+PCLNTAB_MAGIC = b"\xf1\xff\xff\xff\x00\x00\x01\x08"
+R_X86_64_RELATIVE = 8
+ET_DYN = 3
+EM_X86_64 = 62
+PT_LOAD = 1
+PT_DYNAMIC = 2
+PF_X = 1
+DT_RELA = 7
+DT_RELASZ = 8
+MAX_FILE_SIZE = 1 << 31  # sanity bound for the 8-byte offset arithmetic
+
+SYM_GET_CHECKPOINT = "google3/third_party/jetski/cortex/utils/utils.GetCheckpointConfig"
+SYM_GET_DEFAULT = (
+    "google3/third_party/jetski/cortex/utils/utils.GetDefaultCheckpointConfigForModel"
+)
+SYM_APPLY_FEATURE = (
+    "google3/third_party/jetski/cortex/config/config."
+    "applyFeatureProviderCheckpointOverrideConfig"
+)
+SYM_POPULATE = (
+    "google3/third_party/oneharness/internal/core/serializers/serializers."
+    "DefaultSerializer.populateContextWindowMetadata"
+)
+SYM_OFFERS = "google3/third_party/jetski/cli/model/model.SelectorModel.offersContextWindow"
+SYM_CONTEXT_WINDOW = "google3/third_party/jetski/cli/store/store.(*Store).ContextWindow"
+SYM_CONTEXT_WINDOW_CHOICE = (
+    "google3/third_party/jetski/cli/store/store.(*Store).ContextWindowChoice"
+)
+
+# 983040 == 0x000f0000: the UI cap written by this patch.
+# 1048576 means 1 Mi-token, not a verified server limit; preset 900K is 900000.
+UI_CONTEXT_CAP = 983040
+
+
+def _bytes(hex_text):
+    return bytes.fromhex(hex_text)
+
+
+# Every entry is a same-length in-function replacement.  "old" lists all
+# accepted baseline encodings (build variants); exactly one must match.
+PATCH_SPECS = [
+    {
+        "label": "GetCheckpointConfig: remove 256000-token clamp",
+        "symbol": SYM_GET_CHECKPOINT,
+        "mode": "exact",
+        "old": [_bytes("8b54244c81fa00e80300be00e803000f42f289742450")],
+        "new": _bytes("8b54244c81fa00e8030089d690909090909089742450"),
+    },
+    {
+        "label": "GetCheckpointConfig: default max token limit -> 983040",
+        "symbol": SYM_GET_CHECKPOINT,
+        "mode": "exact",
+        "old": [_bytes("837a14007f07c7400c00e80300")],
+        # mov dword [rax+0xc], 0x000f0000 (983040) instead of 256000
+        "new": _bytes("837a14007f07c7400c00000f00"),
+    },
+    {
+        "label": "GetCheckpointConfig: Enabled=false",
+        "symbol": SYM_GET_CHECKPOINT,
+        "mode": "exact",
+        "old": [_bytes("48898424b8000000c60001")],
+        "new": _bytes("48898424b8000000c60000"),
+    },
+    {
+        "label": "GetDefaultCheckpointConfigForModel: Enabled=false",
+        "symbol": SYM_GET_DEFAULT,
+        "mode": "exact",
+        "old": [_bytes("4889842480000000c60001")],
+        "new": _bytes("4889842480000000c60000"),
+    },
+    {
+        "label": "applyFeatureProviderCheckpointOverrideConfig: skip experiment merge",
+        "symbol": SYM_APPLY_FEATURE,
+        "mode": "exact",
+        "old": [_bytes("ffd284c07508")],
+        "new": _bytes("ffd284c09090"),
+    },
+    {
+        "label": "populateContextWindowMetadata: max context tokens -> 983040",
+        "symbol": SYM_POPULATE,
+        "mode": "exact",
+        "old": [
+            _bytes("4889442470488b8c24a00100008908b830000000"),
+            _bytes("4889442470488b8c24a80100008908b830000000"),
+        ],
+        # mov [rsp+0x70],rax; mov dword [rax],0x000f0000; 4x nop; mov eax,0x30
+        "new": _bytes("4889442470c70000000f0090909090b830000000"),
+    },
+    {
+        "label": "offersContextWindow: always true",
+        "symbol": SYM_OFFERS,
+        "mode": "head",
+        "prologue": [_bytes("4989e44981ec683d00000f82d5010000")],
+        "old": _bytes("4989e4"),
+        # mov al,1; ret
+        "new": _bytes("b001c3"),
+    },
+    {
+        "label": "Store.ContextWindow: use the selected preset",
+        "symbol": SYM_CONTEXT_WINDOW,
+        "mode": "head",
+        "prologue": [_bytes("4c8d6424804d3b6610")],
+        "old": _bytes("4c8d642480"),
+        "jump": SYM_CONTEXT_WINDOW_CHOICE,
+    },
+]
+
+
+def _check_specs():
+    if struct.pack("<I", UI_CONTEXT_CAP) != b"\x00\x00\x0f\x00":
+        raise AssertionError("internal patch table error: UI cap encoding")
+    for spec in PATCH_SPECS:
+        if spec["mode"] == "exact":
+            for variant in spec["old"]:
+                if len(variant) != len(spec["new"]):
+                    raise AssertionError(
+                        "internal patch table error: %s" % spec["label"]
+                    )
+        elif "new" in spec:
+            if len(spec["new"]) != len(spec["old"]):
+                raise AssertionError("internal patch table error: %s" % spec["label"])
+        elif len(spec["old"]) != 5:
+            raise AssertionError("internal patch table error: %s" % spec["label"])
+
+
+_check_specs()
+
+
+class PatchError(Exception):
+    pass
+
+
+def fail(message):
+    raise PatchError(message)
+
+
+# --------------------------------------------------------------------------
+# hashing / atomic file helpers
+# --------------------------------------------------------------------------
+
+
+def sha256_file(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        while True:
+            block = handle.read(CHUNK)
+            if not block:
+                break
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def sha256_with_edits(path, edits):
+    """Hash the file as if ``edits`` (offset, new_bytes) had been applied."""
+
+    digest = hashlib.sha256()
+    ordered = sorted((edit.offset, edit.new) for edit in edits)
+    with open(path, "rb") as handle:
+        position = 0
+        for offset, new in ordered:
+            while position < offset:
+                block = handle.read(min(CHUNK, offset - position))
+                if not block:
+                    fail("%s: unexpected end of file while hashing" % path)
+                digest.update(block)
+                position += len(block)
+            digest.update(new)
+            handle.seek(offset + len(new))
+            position = offset + len(new)
+        while True:
+            block = handle.read(CHUNK)
+            if not block:
+                break
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _copy_range(source, target, count):
+    while count > 0:
+        block = source.read(min(CHUNK, count))
+        if not block:
+            fail("unexpected end of file while writing patched binary")
+        target.write(block)
+        count -= len(block)
+
+
+def write_patched(source_path, target_path, edits, source_stat):
+    ordered = sorted((edit.offset, edit.new) for edit in edits)
+    with open(source_path, "rb") as source, open(target_path, "wb") as target:
+        position = 0
+        for offset, new in ordered:
+            _copy_range(source, target, offset - position)
+            target.write(new)
+            source.seek(offset + len(new))
+            position = offset + len(new)
+        _copy_range(source, target, os.fstat(source.fileno()).st_size - position)
+        target.flush()
+        os.fsync(target.fileno())
+    os.chmod(target_path, stat.S_IMODE(source_stat.st_mode))
+    try:
+        os.chown(target_path, source_stat.st_uid, source_stat.st_gid)
+    except (PermissionError, AttributeError):
+        pass
+
+
+def fsync_dir(path):
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def temp_in_dir(directory, prefix):
+    fd, path = tempfile.mkstemp(dir=directory, prefix=prefix, suffix=".tmp")
+    os.close(fd)
+    return path
+
+
+def atomic_write_json(path, payload):
+    directory = os.path.dirname(path)
+    os.makedirs(directory, exist_ok=True)
+    temp_path = temp_in_dir(directory, ".manifest-")
+    try:
+        with open(temp_path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)
+        fsync_dir(directory)
+    finally:
+        if os.path.exists(temp_path):
+            os.unlink(temp_path)
+
+
+# --------------------------------------------------------------------------
+# ELF / Go metadata
+# --------------------------------------------------------------------------
+
+
+class Segment:
+    __slots__ = ("offset", "vaddr", "filesz", "flags")
+
+    def __init__(self, offset, vaddr, filesz, flags):
+        self.offset = offset
+        self.vaddr = vaddr
+        self.filesz = filesz
+        self.flags = flags
+
+
+class ElfImage:
+    def __init__(self, path, data):
+        self.path = path
+        self.data = data
+        if len(data) < 64 or data[:4] != ELF_MAGIC:
+            fail("%s: not an ELF file" % path)
+        if data[4] != 2 or data[5] != 1:
+            fail("%s: not a 64-bit little-endian ELF file" % path)
+        e_type, e_machine = struct.unpack_from("<HH", data, 16)
+        if e_type != ET_DYN:
+            fail("%s: not a position-independent executable" % path)
+        if e_machine != EM_X86_64:
+            fail("%s: not an x86-64 binary" % path)
+        e_phoff, = struct.unpack_from("<Q", data, 32)
+        e_phentsize, e_phnum = struct.unpack_from("<HH", data, 54)
+        if e_phentsize != 56:
+            fail("%s: unexpected program header size" % path)
+        self.segments = []
+        self.dynamic = None
+        for index in range(e_phnum):
+            offset = e_phoff + index * e_phentsize
+            if offset + e_phentsize > len(data):
+                fail("%s: truncated program header table" % path)
+            p_type, p_flags = struct.unpack_from("<II", data, offset)
+            p_offset, p_vaddr, _paddr, p_filesz, _memsz, _align = struct.unpack_from(
+                "<QQQQQQ", data, offset + 8
+            )
+            if p_filesz == 0:
+                continue
+            if p_offset + p_filesz > len(data):
+                fail("%s: program header points past end of file" % path)
+            self.segments.append(Segment(p_offset, p_vaddr, p_filesz, p_flags))
+            if p_type == PT_DYNAMIC:
+                self.dynamic = (p_offset, p_filesz)
+
+    def va_to_off(self, vaddr, size=1):
+        for segment in self.segments:
+            if segment.vaddr <= vaddr and vaddr + size <= segment.vaddr + segment.filesz:
+                return segment.offset + (vaddr - segment.vaddr)
+        return None
+
+    def off_to_va(self, offset):
+        for segment in self.segments:
+            if segment.offset <= offset < segment.offset + segment.filesz:
+                return segment.vaddr + (offset - segment.offset)
+        return None
+
+    def is_executable(self, vaddr, size=1):
+        if self.va_to_off(vaddr, size) is None:
+            return False
+        for segment in self.segments:
+            if segment.vaddr <= vaddr and vaddr + size <= segment.vaddr + segment.filesz:
+                return bool(segment.flags & PF_X)
+        return False
+
+    def read(self, vaddr, size):
+        offset = self.va_to_off(vaddr, size)
+        if offset is None:
+            fail("%s: address 0x%x (+0x%x) is not mapped" % (self.path, vaddr, size))
+        return bytes(self.data[offset : offset + size])
+
+    def relative_relocations(self):
+        if self.dynamic is None:
+            fail("%s: no PT_DYNAMIC segment" % self.path)
+        dyn_offset, dyn_size = self.dynamic
+        rela_va = None
+        rela_size = None
+        for index in range(dyn_size // 16):
+            tag, value = struct.unpack_from("<QQ", self.data, dyn_offset + index * 16)
+            if tag == 0:
+                break
+            if tag == DT_RELA:
+                rela_va = value
+            elif tag == DT_RELASZ:
+                rela_size = value
+        if rela_va is None or rela_size is None:
+            fail("%s: no DT_RELA relocation table" % self.path)
+        if rela_size % 24:
+            fail("%s: malformed DT_RELA table" % self.path)
+        table_offset = self.va_to_off(rela_va, rela_size)
+        if table_offset is None:
+            fail("%s: DT_RELA table is not mapped" % self.path)
+        relocations = {}
+        mask = (1 << 64) - 1
+        for index in range(rela_size // 24):
+            entry = table_offset + index * 24
+            r_offset, r_info, r_addend = struct.unpack_from(
+                "<QQq", self.data, entry
+            )
+            if (r_info & 0xFFFFFFFF) != R_X86_64_RELATIVE or (r_info >> 32) != 0:
+                continue
+            relocations[r_offset] = r_addend & mask
+        return relocations
+
+
+class GoImage:
+    """Locate the Go pclntab, moduledata and function table of an agy build."""
+
+    def __init__(self, elf):
+        self.elf = elf
+        data = elf.data
+        relocations = elf.relative_relocations()
+
+        candidates = {}
+        position = 0
+        while True:
+            hit = data.find(PCLNTAB_MAGIC, position)
+            if hit < 0:
+                break
+            position = hit + 1
+            vaddr = elf.off_to_va(hit)
+            if vaddr is None:
+                continue
+            header = self._parse_pc_header(hit)
+            if header is None:
+                continue
+            if elf.va_to_off(vaddr + header["pcln_offset"]) is None:
+                continue
+            candidates[vaddr] = header
+        if not candidates:
+            fail("%s: no Go pclntab header found" % elf.path)
+
+        confirmed = []
+        for destination, addend in relocations.items():
+            header = candidates.get(addend)
+            if header is None:
+                continue
+            if relocations.get(destination + 8) != addend + header["fname_offset"]:
+                continue
+            confirmed.append((destination, addend, header))
+        if len(confirmed) != 1:
+            fail(
+                "%s: could not uniquely identify the Go moduledata (%d candidates)"
+                % (elf.path, len(confirmed))
+            )
+        module_va, pcln_va, header = confirmed[0]
+        self.module_va = module_va
+        self.pcln_va = pcln_va
+        self.nfunc = header["nfunc"]
+        self.nfiles = header["nfiles"]
+        self.fname_offset = header["fname_offset"]
+        self.pcln_offset = header["pcln_offset"]
+        self.filetab_offset = header["filetab_offset"]
+        self.cu_offset = header["cu_offset"]
+
+        def field(offset, name):
+            value = relocations.get(module_va + offset)
+            if value is None:
+                fail("%s: moduledata field %s is not relocated" % (elf.path, name))
+            return value
+
+        minpc = field(0xA0, "minpc")
+        maxpc = field(0xA8, "maxpc")
+        text = field(0xB0, "text")
+        etext = field(0xB8, "etext")
+        pcln_table = field(0x68, "pclntable")
+        ftab_table = field(0x80, "ftab")
+        if text != minpc:
+            fail("%s: moduledata minpc (0x%x) != text (0x%x)" % (elf.path, minpc, text))
+        if not (text < maxpc < etext):
+            fail("%s: inconsistent moduledata text range" % elf.path)
+        if text % 16:
+            fail("%s: text start 0x%x is not 16-byte aligned" % (elf.path, text))
+        if not elf.is_executable(text):
+            fail("%s: text start 0x%x is not in an executable segment" % (elf.path, text))
+        if ftab_table != pcln_va + self.pcln_offset:
+            fail("%s: unsupported pclntab layout (ftab relocation mismatch)" % elf.path)
+        if pcln_table != ftab_table:
+            fail("%s: unsupported pclntab layout (pclntable != ftab)" % elf.path)
+        self.text = text
+        self.etext = etext
+        self.maxpc = maxpc
+
+        ftab_len_offset = elf.va_to_off(module_va + 0x88, 8)
+        if ftab_len_offset is None:
+            fail("%s: moduledata ftab length is not mapped" % elf.path)
+        ftab_len, = struct.unpack_from("<Q", data, ftab_len_offset)
+        if ftab_len != self.nfunc + 1:
+            fail(
+                "%s: unexpected ftab length %d (nfunc=%d)"
+                % (elf.path, ftab_len, self.nfunc)
+            )
+        table_offset = elf.va_to_off(ftab_table, ftab_len * 8)
+        if table_offset is None:
+            fail("%s: function table is not mapped" % elf.path)
+        self.entries = []
+        previous = -1
+        for index in range(ftab_len):
+            entryoff, funcoff = struct.unpack_from(
+                "<II", data, table_offset + index * 8
+            )
+            if entryoff < previous:
+                fail("%s: function table is not sorted" % elf.path)
+            previous = entryoff
+            self.entries.append((entryoff, funcoff))
+
+        fname_va = pcln_va + self.fname_offset
+        self.fname_va = fname_va
+        self.fname_len = self.cu_offset - self.fname_offset
+        if self.fname_len <= 0:
+            fail("%s: empty funcnametab" % elf.path)
+        self._func_base_va = pcln_table
+        for index in range(ftab_len - 1):
+            entryoff, funcoff = self.entries[index]
+            func_addr = self._func_base_va + funcoff
+            func_offset = elf.va_to_off(func_addr, 12)
+            if func_offset is None:
+                fail("%s: _func entry %d is not mapped" % (elf.path, index))
+            recorded, _nameoff = struct.unpack_from("<Ii", data, func_offset)
+            if recorded != entryoff:
+                fail(
+                    "%s: function table entry %d is inconsistent" % (elf.path, index)
+                )
+
+    def _parse_pc_header(self, offset):
+        data = self.elf.data
+        if offset + 8 + 64 > len(data):
+            return None
+        if data[offset + 6] != 1 or data[offset + 7] != 8:
+            return None
+        (
+            nfunc,
+            nfiles,
+            _text_start,
+            fname_offset,
+            cu_offset,
+            filetab_offset,
+            pctab_offset,
+            pcln_offset,
+        ) = struct.unpack_from("<8Q", data, offset + 8)
+        if not (0 < nfunc < 10_000_000):
+            return None
+        if not (0 < nfiles < 10_000_000):
+            return None
+        if not (0 < fname_offset < cu_offset < filetab_offset < pctab_offset < pcln_offset):
+            return None
+        if pcln_offset > MAX_FILE_SIZE:
+            return None
+        return {
+            "nfunc": nfunc,
+            "nfiles": nfiles,
+            "fname_offset": fname_offset,
+            "cu_offset": cu_offset,
+            "filetab_offset": filetab_offset,
+            "pcln_offset": pcln_offset,
+        }
+
+    def _name_at(self, name_offset):
+        if not (0 <= name_offset < self.fname_len):
+            fail("%s: function name offset out of range" % self.elf.path)
+        base = self.elf.va_to_off(self.fname_va, self.fname_len)
+        if base is None:
+            fail("%s: funcnametab is not mapped" % self.elf.path)
+        start = base + name_offset
+        end = self.elf.data.find(b"\0", start, base + self.fname_len)
+        if end < 0 or end - start > 65536:
+            fail("%s: malformed function name" % self.elf.path)
+        try:
+            return self.elf.data[start:end].decode("utf-8")
+        except UnicodeDecodeError:
+            fail("%s: non-UTF-8 function name" % self.elf.path)
+
+    def find_functions(self, wanted):
+        found = {name: [] for name in wanted}
+        for index in range(len(self.entries) - 1):
+            entryoff, funcoff = self.entries[index]
+            func_offset = self.elf.va_to_off(
+                self._func_base_va + funcoff, 12
+            )
+            if func_offset is None:
+                fail("%s: _func entry %d is not mapped" % (self.elf.path, index))
+            _entry, nameoff = struct.unpack_from("<Ii", self.elf.data, func_offset)
+            name = self._name_at(nameoff)
+            if name in found:
+                next_entryoff = self.entries[index + 1][0]
+                found[name].append((self.text + entryoff, next_entryoff - entryoff))
+        return found
+
+    def summary(self):
+        return {
+            "functions": self.nfunc,
+            "files": self.nfiles,
+            "text": "0x%x" % self.text,
+            "etext": "0x%x" % self.etext,
+            "moduledata": "0x%x" % self.module_va,
+        }
+
+
+# --------------------------------------------------------------------------
+# patch analysis
+# --------------------------------------------------------------------------
+
+
+class Edit:
+    __slots__ = ("label", "symbol", "va", "offset", "old", "new")
+
+    def __init__(self, label, symbol, va, offset, old, new):
+        self.label = label
+        self.symbol = symbol
+        self.va = va
+        self.offset = offset
+        self.old = old
+        self.new = new
+
+
+def _jump_bytes(go, funcs, spec, source_va):
+    target = funcs.get(spec["jump"], [])
+    if len(target) != 1:
+        fail("%s: jump target %s not found exactly once" % (go.elf.path, spec["jump"]))
+    displacement = target[0][0] - (source_va + 5)
+    if not -(1 << 31) <= displacement < (1 << 31):
+        fail("%s: jump target out of range" % go.elf.path)
+    return b"\xe9" + struct.pack("<i", displacement)
+
+
+def analyze(go):
+    """Return (state, edits, function map) where state is pristine|patched."""
+
+    wanted = {spec["symbol"] for spec in PATCH_SPECS} | {SYM_CONTEXT_WINDOW_CHOICE}
+    funcs = go.find_functions(wanted)
+    edits = []
+    states = []
+    for spec in PATCH_SPECS:
+        matches = funcs.get(spec["symbol"], [])
+        if len(matches) != 1:
+            fail(
+                "%s: expected exactly one %s, found %d"
+                % (go.elf.path, spec["symbol"], len(matches))
+            )
+        function_va, function_size = matches[0]
+        if function_size <= 0:
+            fail("%s: zero-sized function %s" % (go.elf.path, spec["symbol"]))
+        body = go.elf.read(function_va, function_size)
+        if spec["mode"] == "exact":
+            old_offset = None
+            old_bytes = None
+            for variant in spec["old"]:
+                first = body.find(variant)
+                if first < 0:
+                    continue
+                if body.find(variant, first + 1) >= 0:
+                    fail(
+                        "%s: %s baseline signature is ambiguous"
+                        % (go.elf.path, spec["label"])
+                    )
+                if old_offset is not None:
+                    fail(
+                        "%s: %s matches more than one baseline variant"
+                        % (go.elf.path, spec["label"])
+                    )
+                old_offset = first
+                old_bytes = variant
+            new_hits = body.count(spec["new"])
+            if old_offset is not None and new_hits == 0:
+                states.append("old")
+                edits.append(
+                    Edit(
+                        spec["label"],
+                        spec["symbol"],
+                        function_va,
+                        go.elf.va_to_off(function_va, function_size) + old_offset,
+                        old_bytes,
+                        spec["new"],
+                    )
+                )
+            elif old_offset is None and new_hits == 1:
+                states.append("new")
+            else:
+                fail(
+                    "%s: %s is not in a known state (baseline=%s patched=%d)"
+                    % (
+                        go.elf.path,
+                        spec["label"],
+                        "found" if old_offset is not None else "missing",
+                        new_hits,
+                    )
+                )
+        else:  # head patch
+            new_bytes = spec.get("new")
+            if new_bytes is None:
+                new_bytes = _jump_bytes(go, funcs, spec, function_va)
+            prologue_ok = any(body.startswith(p) for p in spec["prologue"])
+            if prologue_ok and body.startswith(spec["old"]):
+                states.append("old")
+                edits.append(
+                    Edit(
+                        spec["label"],
+                        spec["symbol"],
+                        function_va,
+                        go.elf.va_to_off(function_va, function_size),
+                        spec["old"],
+                        new_bytes,
+                    )
+                )
+            elif body.startswith(new_bytes):
+                states.append("new")
+            else:
+                fail(
+                    "%s: %s has unexpected entry bytes %s"
+                    % (go.elf.path, spec["symbol"], body[:16].hex())
+                )
+    if all(state == "old" for state in states):
+        state = "pristine"
+    elif all(state == "new" for state in states):
+        state = "patched"
+    else:
+        fail(
+            "%s: mixed patch state (%s)"
+            % (
+                go.elf.path,
+                ", ".join(
+                    "%s=%s" % (spec["symbol"].rsplit(".", 1)[-1], state_kind)
+                    for spec, state_kind in zip(PATCH_SPECS, states)
+                ),
+            )
+        )
+    if state == "pristine":
+        ordered = sorted(edits, key=lambda edit: edit.offset)
+        for previous, current in zip(ordered, ordered[1:]):
+            if previous.offset + len(previous.new) > current.offset:
+                fail("%s: overlapping patch sites" % go.elf.path)
+    return state, edits, funcs
+
+
+# --------------------------------------------------------------------------
+# state directory / manifest / backups
+# --------------------------------------------------------------------------
+
+
+def state_directory():
+    override = os.environ.get("AGY_PATCH_STATE_DIR")
+    if override:
+        return os.path.abspath(override)
+    base = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
+    return os.path.abspath(os.path.join(base, "agy-patch"))
+
+
+def manifest_path(state_dir, real_path):
+    key = hashlib.sha256(real_path.encode("utf-8")).hexdigest()[:16]
+    return os.path.join(state_dir, "manifests", key + ".json")
+
+
+def load_manifest(state_dir, real_path):
+    path = manifest_path(state_dir, real_path)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            manifest = json.load(handle)
+    except (OSError, ValueError) as error:
+        fail("%s: unreadable manifest (%s)" % (path, error))
+    if manifest.get("schema") != 1:
+        fail("%s: unsupported manifest schema" % path)
+    if manifest.get("binary") != real_path:
+        fail("%s: manifest belongs to another binary" % path)
+    manifest["_path"] = path
+    return manifest
+
+
+def ensure_backup(real_path, state_dir, original_sha, source_stat):
+    backup_dir = os.path.join(state_dir, "backups")
+    os.makedirs(backup_dir, exist_ok=True)
+    backup_path = os.path.join(backup_dir, original_sha + ".bin")
+    if os.path.exists(backup_path):
+        if sha256_file(backup_path) != original_sha:
+            fail(
+                "%s: existing backup does not match the original binary; "
+                "refusing to overwrite it" % backup_path
+            )
+        return backup_path
+    temp_path = temp_in_dir(backup_dir, ".backup-")
+    try:
+        with open(real_path, "rb") as source, open(temp_path, "wb") as target:
+            shutil.copyfileobj(source, target, CHUNK)
+            target.flush()
+            os.fsync(target.fileno())
+        os.chmod(temp_path, stat.S_IMODE(source_stat.st_mode))
+        if sha256_file(temp_path) != original_sha:
+            fail("backup verification failed (source changed during copy)")
+        os.replace(temp_path, backup_path)
+        fsync_dir(backup_dir)
+    finally:
+        if os.path.exists(temp_path):
+            os.unlink(temp_path)
+    return backup_path
+
+
+def assert_unchanged(real_path, original_stat, original_sha):
+    current = os.lstat(real_path)
+    for attribute in ("st_dev", "st_ino", "st_size", "st_mtime_ns"):
+        if getattr(original_stat, attribute) != getattr(current, attribute):
+            fail("%s changed while patching; aborting" % real_path)
+    if sha256_file(real_path) != original_sha:
+        fail("%s content changed while patching; aborting" % real_path)
+
+
+# --------------------------------------------------------------------------
+# commands
+# --------------------------------------------------------------------------
+
+
+def resolve_binary(argument, allow_symlink):
+    if argument:
+        path = os.path.abspath(argument)
+    else:
+        found = shutil.which("agy")
+        if not found:
+            fail("agy was not found in PATH; pass --binary PATH")
+        path = os.path.abspath(found)
+    if not os.path.lexists(path):
+        fail("%s: no such file" % path)
+    if os.path.islink(path) and not allow_symlink:
+        fail(
+            "%s is a symlink; pass --binary pointing at the real file "
+            "(symlinks are not patched in place)" % path
+        )
+    if not os.path.isfile(path):
+        fail("%s: not a regular file" % path)
+    return path, os.path.realpath(path)
+
+
+def command_status(args):
+    path, real = resolve_binary(args.binary, allow_symlink=True)
+    real_stat = os.stat(real)
+    digest = sha256_file(real)
+    with open(real, "rb") as handle:
+        mapping = mmap.mmap(handle.fileno(), 0, access=mmap.ACCESS_READ)
+        try:
+            elf = ElfImage(real, mapping)
+            go = GoImage(elf)
+            state, _edits, _funcs = analyze(go)
+            summary = go.summary()
+        finally:
+            mapping.close()
+
+    print("binary:   %s" % real)
+    print("sha256:   %s" % digest)
+    if real != path:
+        print("symlink:  %s -> %s" % (path, real))
+    print(
+        "go table: %d functions, %d files, text=%s, etext=%s"
+        % (
+            summary["functions"],
+            summary["files"],
+            summary["text"],
+            summary["etext"],
+        )
+    )
+    if state == "pristine":
+        print("state:    pristine (%s; not patched)" % (
+            "verified agy " + KNOWN_BUILDS[digest] if digest in KNOWN_BUILDS
+            else "signature-compatible, UNVERIFIED build"
+        ))
+    else:
+        print("state:    patched (%d byte edits present)" % len(PATCH_SPECS))
+
+    state_dir = state_directory()
+    manifest = load_manifest(state_dir, real)
+    if manifest is None:
+        print("manifest: none")
+        return 0
+    print("manifest: %s" % manifest["_path"])
+    print("  created: %s" % manifest.get("created_at", "?"))
+    if state == "patched":
+        if digest == manifest.get("patched_sha256"):
+            print("  status:  verified against this build")
+        else:
+            print("  status:  STALE (binary hash does not match manifest)")
+    else:
+        print("  status:  stale (binary is not the patched build)")
+    backup_path = manifest.get("backup", "")
+    if os.path.exists(backup_path):
+        if sha256_file(backup_path) == manifest.get("original_sha256"):
+            print("backup:   %s (sha256 verified)" % backup_path)
+        else:
+            print("backup:   %s (CHECKSUM MISMATCH)" % backup_path)
+    else:
+        print("backup:   %s (missing)" % backup_path)
+    print("original: %s" % manifest.get("original_sha256", "?"))
+    print("patched:  %s" % manifest.get("patched_sha256", "?"))
+    if not os.path.exists(manifest["_path"]):
+        print("warning: manifest disappeared during status")
+    return 0
+
+
+def _print_edits(edits):
+    for edit in edits:
+        print(
+            "  %-62s va=0x%x offset=0x%x %s -> %s"
+            % (
+                edit.symbol.rsplit(".", 1)[-1],
+                edit.va,
+                edit.offset,
+                edit.old.hex(),
+                edit.new.hex(),
+            )
+        )
+
+
+def command_apply(args):
+    path, real = resolve_binary(args.binary, allow_symlink=False)
+    source_stat = os.lstat(real)
+    current_sha = sha256_file(real)
+    state_dir = state_directory()
+    manifest = load_manifest(state_dir, real)
+
+    with open(real, "rb") as handle:
+        mapping = mmap.mmap(handle.fileno(), 0, access=mmap.ACCESS_READ)
+        try:
+            elf = ElfImage(real, mapping)
+            go = GoImage(elf)
+            state, edits, _funcs = analyze(go)
+            summary = go.summary()
+        finally:
+            mapping.close()
+
+    if state == "patched":
+        if manifest is None:
+            fail(
+                "%s: binary is already patched but the manifest is missing; "
+                "refusing to continue" % real
+            )
+        if current_sha != manifest.get("patched_sha256"):
+            fail(
+                "%s: binary is patched but does not match the manifest; "
+                "refusing to continue" % real
+            )
+        print("already patched: %s" % real)
+        print("sha256:          %s (matches manifest)" % current_sha)
+        return 0
+    if current_sha not in KNOWN_BUILDS:
+        fail("%s: unverified original SHA256 %s; refusing unknown build" % (real, current_sha))
+    if manifest is not None and manifest.get("original_sha256") != current_sha:
+        print(
+            "warning: an older manifest exists for a different build; "
+            "it will be replaced"
+        )
+
+    original_sha = current_sha
+    patched_sha = sha256_with_edits(real, edits)
+    print("binary:   %s" % real)
+    print(
+        "go table: %d functions, text=%s"
+        % (summary["functions"], summary["text"])
+    )
+    print("edits:    %d byte replacements" % len(edits))
+    _print_edits(edits)
+    print("sha256:   %s -> %s" % (original_sha, patched_sha))
+    if args.dry_run:
+        print("dry-run:  no files were written")
+        return 0
+
+    backup_path = ensure_backup(real, state_dir, original_sha, source_stat)
+    print("backup:   %s (sha256 verified)" % backup_path)
+
+    directory = os.path.dirname(real)
+    temp_path = temp_in_dir(directory, ".agy-patch-")
+    try:
+        write_patched(real, temp_path, edits, source_stat)
+        if sha256_file(temp_path) != patched_sha:
+            fail("patched temporary file failed checksum verification")
+        assert_unchanged(real, source_stat, original_sha)
+        os.replace(temp_path, real)
+        fsync_dir(directory)
+    finally:
+        if os.path.exists(temp_path):
+            os.unlink(temp_path)
+
+    final_sha = sha256_file(real)
+    if final_sha != patched_sha:
+        fail("%s: post-write checksum mismatch (%s)" % (real, final_sha))
+
+    manifest_payload = {
+        "schema": 1,
+        "tool": "agy-patch",
+        "binary": real,
+        "binary_size": source_stat.st_size,
+        "original_sha256": original_sha,
+        "patched_sha256": patched_sha,
+        "backup": backup_path,
+        "backup_sha256": original_sha,
+        "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "edits": [
+            {
+                "label": edit.label,
+                "symbol": edit.symbol,
+                "va": "0x%x" % edit.va,
+                "offset": edit.offset,
+                "old": edit.old.hex(),
+                "new": edit.new.hex(),
+            }
+            for edit in edits
+        ],
+    }
+    try:
+        atomic_write_json(manifest_path(state_dir, real), manifest_payload)
+    except OSError as error:
+        print(
+            "error: binary was patched but the manifest could not be written: %s"
+            % error,
+            file=sys.stderr,
+        )
+        print(
+            "       backup: %s\n       original sha256: %s\n"
+            "       patched sha256:  %s\n"
+            "       restore manually from the backup after verifying its hash."
+            % (backup_path, original_sha, patched_sha),
+            file=sys.stderr,
+        )
+        return 1
+    print("patched:  %s" % real)
+    print("manifest: %s" % manifest_path(state_dir, real))
+    print("restore:  agy-patch restore --binary %s" % real)
+    return 0
+
+
+def command_restore(args):
+    path, real = resolve_binary(args.binary, allow_symlink=False)
+    state_dir = state_directory()
+    manifest = load_manifest(state_dir, real)
+    if manifest is None:
+        fail("%s: no manifest found; nothing to restore" % real)
+    live_sha = sha256_file(real)
+    if live_sha == manifest.get("original_sha256"):
+        fail("%s: binary already matches the original; nothing to restore" % real)
+    if live_sha != manifest.get("patched_sha256"):
+        fail(
+            "%s: live binary hash %s does not match the patched hash in the "
+            "manifest; refusing to overwrite a binary changed after patching"
+            % (real, live_sha)
+        )
+    backup_path = manifest.get("backup", "")
+    if not os.path.exists(backup_path):
+        fail("%s: backup is missing; cannot restore" % backup_path)
+    backup_sha = sha256_file(backup_path)
+    if backup_sha != manifest.get("original_sha256"):
+        fail(
+            "%s: backup checksum mismatch (expected %s, got %s); refusing to "
+            "restore" % (backup_path, manifest.get("original_sha256"), backup_sha)
+        )
+    current_stat = os.lstat(real)
+    directory = os.path.dirname(real)
+    temp_path = temp_in_dir(directory, ".agy-restore-")
+    try:
+        with open(backup_path, "rb") as source, open(temp_path, "wb") as target:
+            shutil.copyfileobj(source, target, CHUNK)
+            target.flush()
+            os.fsync(target.fileno())
+        os.chmod(temp_path, stat.S_IMODE(current_stat.st_mode))
+        if sha256_file(temp_path) != backup_sha:
+            fail("restored temporary file failed checksum verification")
+        assert_unchanged(real, current_stat, live_sha)
+        os.replace(temp_path, real)
+        fsync_dir(directory)
+    finally:
+        if os.path.exists(temp_path):
+            os.unlink(temp_path)
+    final_sha = sha256_file(real)
+    if final_sha != backup_sha:
+        fail("%s: post-restore checksum mismatch" % real)
+    try:
+        os.unlink(manifest["_path"])
+        fsync_dir(os.path.dirname(manifest["_path"]))
+    except OSError:
+        pass
+    print("restored: %s" % real)
+    print("sha256:   %s (original)" % final_sha)
+    print("backup:   %s (kept)" % backup_path)
+    return 0
+
+
+# --------------------------------------------------------------------------
+# entry point
+# --------------------------------------------------------------------------
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog="agy-patch",
+        description=(
+            "Patch the Antigravity CLI (agy) for 1M-class context windows. "
+            "Reads and rewrites only the agy binary; never touches settings."
+        ),
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    status = subparsers.add_parser("status", help="show binary and patch state")
+    status.add_argument("--binary", help="path to agy (default: agy in PATH)")
+    status.set_defaults(func=command_status)
+    apply_parser = subparsers.add_parser("apply", help="verify and patch the binary")
+    apply_parser.add_argument("--binary", help="path to agy (default: agy in PATH)")
+    apply_parser.add_argument(
+        "--dry-run", action="store_true", help="verify and report without writing"
+    )
+    apply_parser.set_defaults(func=command_apply)
+    restore = subparsers.add_parser("restore", help="restore the backed-up binary")
+    restore.add_argument("--binary", help="path to agy (default: agy in PATH)")
+    restore.set_defaults(func=command_restore)
+    return parser
+
+
+def main(argv):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        return args.func(args)
+    except PatchError as error:
+        print("error: %s" % error, file=sys.stderr)
+        return 1
+    except OSError as error:
+        print("error: %s" % error, file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print("error: interrupted", file=sys.stderr)
+        return 130
+    except Exception:  # pragma: no cover - defensive, keeps failures closed
+        traceback.print_exc()
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
