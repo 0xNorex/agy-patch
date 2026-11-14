@@ -4,7 +4,7 @@ Reversible patcher for **Antigravity CLI (`agy`)** and **Antigravity Desktop** o
 
 - **`cli` (`agy`)**: disables automatic checkpoint/compaction, removes the `256000` token clamp, raises internal context limits to `983040`, and exposes context-window presets for all models.
 - **`desktop-context` (`resources/bin/language_server`)**: disables automatic checkpoint/compaction, removes the `256000` clamp, raises default max token limit and `max_context_tokens` to `983040`.
-- **`desktop-zh` (`resources/app.asar`)**: lossless Simplified Chinese (`zh-CN`) localization for Antigravity Desktop — injects a guarded `MutationObserver` DOM engine into Electron preloads plus native main-process menu, tray, right-click context menu, and dialog translations.
+- **`desktop-zh` (`resources/app.asar`)**: lossless Simplified Chinese (`zh-CN`) localization for Antigravity Desktop plus a Wayland/tiling-WM `BaseWindow` `WebContentsView` resize sync fix (`dist/utils.js`) — injects a guarded `MutationObserver` DOM engine into Electron preloads plus native main-process menu, tray, right-click context menu, and dialog translations.
 
 ## Design Guarantees
 

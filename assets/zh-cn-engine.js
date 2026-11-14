@@ -175,8 +175,20 @@
     if (/^See\s+(\d+)\s+more$/i.test(trimmed)) {
       return cacheAndReturn(text, trimmed, trimmed.replace(/^See\s+(\d+)\s+more$/i, '查看更多 ($1)'));
     }
+    if (/^See\s+all\s*\((\d+)\)$/i.test(trimmed)) {
+      return cacheAndReturn(text, trimmed, trimmed.replace(/^See\s+all\s*\((\d+)\)$/i, '查看全部 ($1)'));
+    }
     if (/^See\s+less$/i.test(trimmed)) {
       return cacheAndReturn(text, trimmed, '收起');
+    }
+    if (/^Good to see you,\s*(.+?)\.\s*What's next\?$/i.test(trimmed)) {
+      return cacheAndReturn(text, trimmed, trimmed.replace(/^Good to see you,\s*(.+?)\.\s*What's next\?$/i, '很高兴见到你，$1。接下来做什么？'));
+    }
+    if (/^Welcome back,\s*(.+?)\.\s*Where should we pick up\?$/i.test(trimmed)) {
+      return cacheAndReturn(text, trimmed, trimmed.replace(/^Welcome back,\s*(.+?)\.\s*Where should we pick up\?$/i, '欢迎回来，$1。我们从哪里继续？'));
+    }
+    if (/^Hey\s+(.+?),\s*what should we build today\?$/i.test(trimmed)) {
+      return cacheAndReturn(text, trimmed, trimmed.replace(/^Hey\s+(.+?),\s*what should we build today\?$/i, '嗨 $1，今天想构建些什么？'));
     }
     if (/^(\d+)\s+(?:tools?|工具)\s+enabled$/i.test(trimmed)) {
       return cacheAndReturn(text, trimmed, trimmed.replace(/^(\d+)\s+(?:tools?|工具)\s+enabled$/i, '已启用 $1 个工具'));
@@ -220,6 +232,14 @@
     if (/[-_\\/.]/.test(core)) return text;
     const wordsCount = core.split(/\s+/).filter(Boolean).length;
     if (wordsCount > 3 || !CORE_WORDS_UNION_REGEX) return text;
+
+    const alphaTokens = core.match(/[A-Za-z][A-Za-z'-]*/g) || [];
+    for (let ti = 0; ti < alphaTokens.length; ti++) {
+      const tok = alphaTokens[ti];
+      if (tok.length >= 2 && !Object.prototype.hasOwnProperty.call(coreWords, tok.toLowerCase())) {
+        return text;
+      }
+    }
 
     let replaced = false;
     const temp = core.replace(CORE_WORDS_UNION_REGEX, (matched) => {
@@ -519,6 +539,22 @@
 
       tryCombinedSentenceTranslation(node);
 
+      if (node.tagName === 'IFRAME') {
+        const hookFrame = () => {
+          try {
+            const doc = node.contentDocument;
+            if (doc && doc.body) {
+              observeRoot(doc.body);
+              translateNode(doc.body);
+            }
+          } catch (_) {}
+        };
+        hookFrame();
+        if (!node.__agyFrameHooked) {
+          node.__agyFrameHooked = true;
+          node.addEventListener('load', hookFrame);
+        }
+      }
       if (node.shadowRoot) {
         observeRoot(node.shadowRoot);
         translateNode(node.shadowRoot);

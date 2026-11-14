@@ -1081,6 +1081,12 @@ ASAR_NATIVE_REPLACEMENTS = [
     ("dist/remote/remoteManager.js", "title: 'Stop SSH server',", "title: '停止 SSH 服务端',", 2),
     ("dist/remote/remoteManager.js", "buttons: ['Stop Server', 'Cancel'],", "buttons: ['停止服务端', '取消'],", 1),
     ("dist/remote/remoteManager.js", "buttons: ['Sign In', 'Cancel'],", "buttons: ['登录', '取消'],", 1),
+    (
+        "dist/utils.js",
+        "        syncHubViewBounds();\n        baseWin.on('resize', syncHubViewBounds);",
+        "        syncHubViewBounds();\n        baseWin.on('resize', syncHubViewBounds);\n        baseWin.on('show', syncHubViewBounds);\n        baseWin.on('maximize', syncHubViewBounds);\n        baseWin.on('unmaximize', syncHubViewBounds);\n        baseWin.on('restore', syncHubViewBounds);\n        baseWin.on('enter-full-screen', syncHubViewBounds);\n        baseWin.on('leave-full-screen', syncHubViewBounds);\n        hubWcv.webContents?.on?.('did-finish-load', syncHubViewBounds);\n        [50, 150, 400, 1000].forEach((ms) => setTimeout(syncHubViewBounds, ms));",
+        1,
+    ),
 ]
 
 
