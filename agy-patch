@@ -1,18 +1,14 @@
 #!/usr/bin/env python3
-"""Patch the Antigravity CLI (`agy`) for 1M-class context windows.
+"""Reversible patcher for Antigravity CLI (agy) and Desktop (Linux x86-64).
 
-The tool rewrites a fixed, version-checked set of code sites in the Go
-binary (Linux x86-64): it disables automatic checkpointing/compaction,
-removes the 256k token clamp, raises the built-in context-window values to
-the fixed UI maximum (983040 tokens) and makes the model picker offer
-context-window options for every model.
+Supports three targets in a single zero-dependency Python 3.8+ script:
+  - cli:             agy CLI binary (1M-class context window + no auto-compaction)
+  - desktop-context: Desktop resources/bin/language_server (983040 context + no auto-compaction)
+  - desktop-zh:      Desktop resources/app.asar (Simplified Chinese UI + native menus/dialogs)
 
-It never edits settings files and never uses the network.  All edits are
-exact same-length byte replacements inside named Go functions located via
-the Go pclntab and the moduledata relocations of the ELF image.  Unknown or
-ambiguous binaries abort before anything is written.
-
-Tested against agy 1.5.8 and 1.5.7 (the 1.5.7 tables exist for rollback).
+Every target uses fail-closed verification (Go pclntab/moduledata symbols or exact
+ASAR file anchors), SHA256-verified backups and manifests in $XDG_STATE_HOME/agy-patch,
+and atomic file replacement with deterministic rollback.
 """
 
 import argparse
@@ -28,12 +24,27 @@ import tempfile
 import time
 import traceback
 
-KNOWN_BUILDS = {
+# --------------------------------------------------------------------------
+# known verified builds
+# --------------------------------------------------------------------------
+
+KNOWN_CLI_BUILDS = {
+    "39816d49d5ab92229952987225c23ea3fed7580699dcb4a444e0388e0ac1ce43": "1.5.9",
     "9db59b6371107b939befa9c507c0a24989fda974e75d81d8529f3689ef7322e5": "1.5.8",
     "5df525a2d6908989c57b897723caea66e00d7c4d2e24411f91ad306989574642": "1.5.7",
 }
 
+KNOWN_LS_BUILDS = {
+    "4847eb0024fc54fd6ba9d860aad1767e4cc2bdf19e80d2527acf82dd147fc66a": "2.32.1",
+}
+
+KNOWN_ASAR_BUILDS = {
+    "5b493943e67e500638555315594d5b1acbc7a02e6dac3c786651921c1ee8519f": "2.32.1",
+}
+
 CHUNK = 1 << 20
+ASAR_BLOCK_SIZE = 4 * 1024 * 1024
+ASAR_PICKLE_HEADER = struct.Struct("<IIII")
 
 ELF_MAGIC = b"\x7fELF"
 PCLNTAB_MAGIC = b"\xf1\xff\xff\xff\x00\x00\x01\x08"
@@ -45,7 +56,7 @@ PT_DYNAMIC = 2
 PF_X = 1
 DT_RELA = 7
 DT_RELASZ = 8
-MAX_FILE_SIZE = 1 << 31  # sanity bound for the 8-byte offset arithmetic
+MAX_FILE_SIZE = 1 << 31
 
 SYM_GET_CHECKPOINT = "google3/third_party/jetski/cortex/utils/utils.GetCheckpointConfig"
 SYM_GET_DEFAULT = (
@@ -65,95 +76,87 @@ SYM_CONTEXT_WINDOW_CHOICE = (
     "google3/third_party/jetski/cli/store/store.(*Store).ContextWindowChoice"
 )
 
-# 983040 == 0x000f0000: the UI cap written by this patch.
-# 1048576 means 1 Mi-token, not a verified server limit; preset 900K is 900000.
 UI_CONTEXT_CAP = 983040
 
-
-def _bytes(hex_text):
-    return bytes.fromhex(hex_text)
-
-
-# Every entry is a same-length in-function replacement.  "old" lists all
-# accepted baseline encodings (build variants); exactly one must match.
-PATCH_SPECS = [
+BACKEND_PATCH_SPECS = [
     {
         "label": "GetCheckpointConfig: remove 256000-token clamp",
         "symbol": SYM_GET_CHECKPOINT,
         "mode": "exact",
-        "old": [_bytes("8b54244c81fa00e80300be00e803000f42f289742450")],
-        "new": _bytes("8b54244c81fa00e8030089d690909090909089742450"),
+        "old": [bytes.fromhex("8b54244c81fa00e80300be00e803000f42f289742450")],
+        "new": bytes.fromhex("8b54244c81fa00e8030089d690909090909089742450"),
     },
     {
         "label": "GetCheckpointConfig: default max token limit -> 983040",
         "symbol": SYM_GET_CHECKPOINT,
         "mode": "exact",
-        "old": [_bytes("837a14007f07c7400c00e80300")],
-        # mov dword [rax+0xc], 0x000f0000 (983040) instead of 256000
-        "new": _bytes("837a14007f07c7400c00000f00"),
+        "old": [bytes.fromhex("837a14007f07c7400c00e80300")],
+        "new": bytes.fromhex("837a14007f07c7400c00000f00"),
     },
     {
         "label": "GetCheckpointConfig: Enabled=false",
         "symbol": SYM_GET_CHECKPOINT,
         "mode": "exact",
-        "old": [_bytes("48898424b8000000c60001")],
-        "new": _bytes("48898424b8000000c60000"),
+        "old": [bytes.fromhex("48898424b8000000c60001")],
+        "new": bytes.fromhex("48898424b8000000c60000"),
     },
     {
         "label": "GetDefaultCheckpointConfigForModel: Enabled=false",
         "symbol": SYM_GET_DEFAULT,
         "mode": "exact",
-        "old": [_bytes("4889842480000000c60001")],
-        "new": _bytes("4889842480000000c60000"),
+        "old": [bytes.fromhex("4889842480000000c60001")],
+        "new": bytes.fromhex("4889842480000000c60000"),
     },
     {
         "label": "applyFeatureProviderCheckpointOverrideConfig: skip experiment merge",
         "symbol": SYM_APPLY_FEATURE,
         "mode": "exact",
-        "old": [_bytes("ffd284c07508")],
-        "new": _bytes("ffd284c09090"),
+        "old": [bytes.fromhex("ffd284c07508")],
+        "new": bytes.fromhex("ffd284c09090"),
     },
     {
         "label": "populateContextWindowMetadata: max context tokens -> 983040",
         "symbol": SYM_POPULATE,
         "mode": "exact",
         "old": [
-            _bytes("4889442470488b8c24a00100008908b830000000"),
-            _bytes("4889442470488b8c24a80100008908b830000000"),
+            bytes.fromhex("4889442470488b8c24a00100008908b830000000"),
+            bytes.fromhex("4889442470488b8c24a80100008908b830000000"),
         ],
-        # mov [rsp+0x70],rax; mov dword [rax],0x000f0000; 4x nop; mov eax,0x30
-        "new": _bytes("4889442470c70000000f0090909090b830000000"),
+        "new": bytes.fromhex("4889442470c70000000f0090909090b830000000"),
     },
+]
+
+CLI_ONLY_PATCH_SPECS = [
     {
         "label": "offersContextWindow: always true",
         "symbol": SYM_OFFERS,
         "mode": "head",
-        "prologue": [_bytes("4989e44981ec683d00000f82d5010000")],
-        "old": _bytes("4989e4"),
-        # mov al,1; ret
-        "new": _bytes("b001c3"),
+        "prologue": [bytes.fromhex("4989e44981ec683d00000f82d5010000")],
+        "old": bytes.fromhex("4989e4"),
+        "new": bytes.fromhex("b001c3"),
     },
     {
         "label": "Store.ContextWindow: use the selected preset",
         "symbol": SYM_CONTEXT_WINDOW,
         "mode": "head",
-        "prologue": [_bytes("4c8d6424804d3b6610")],
-        "old": _bytes("4c8d642480"),
+        "prologue": [bytes.fromhex("4c8d6424804d3b6610")],
+        "old": bytes.fromhex("4c8d642480"),
         "jump": SYM_CONTEXT_WINDOW_CHOICE,
     },
 ]
+
+CLI_PATCH_SPECS = BACKEND_PATCH_SPECS + CLI_ONLY_PATCH_SPECS
+LS_PATCH_SPECS = BACKEND_PATCH_SPECS
 
 
 def _check_specs():
     if struct.pack("<I", UI_CONTEXT_CAP) != b"\x00\x00\x0f\x00":
         raise AssertionError("internal patch table error: UI cap encoding")
-    for spec in PATCH_SPECS:
+    for spec in CLI_PATCH_SPECS:
         if spec["mode"] == "exact":
             for variant in spec["old"]:
                 if len(variant) != len(spec["new"]):
-                    raise AssertionError(
-                        "internal patch table error: %s" % spec["label"]
-                    )
+                    raise AssertionError("internal patch table error: %s" % spec["label"])
         elif "new" in spec:
             if len(spec["new"]) != len(spec["old"]):
                 raise AssertionError("internal patch table error: %s" % spec["label"])
@@ -189,8 +192,6 @@ def sha256_file(path):
 
 
 def sha256_with_edits(path, edits):
-    """Hash the file as if ``edits`` (offset, new_bytes) had been applied."""
-
     digest = hashlib.sha256()
     ordered = sorted((edit.offset, edit.new) for edit in edits)
     with open(path, "rb") as handle:
@@ -376,9 +377,7 @@ class ElfImage:
         mask = (1 << 64) - 1
         for index in range(rela_size // 24):
             entry = table_offset + index * 24
-            r_offset, r_info, r_addend = struct.unpack_from(
-                "<QQq", self.data, entry
-            )
+            r_offset, r_info, r_addend = struct.unpack_from("<QQq", self.data, entry)
             if (r_info & 0xFFFFFFFF) != R_X86_64_RELATIVE or (r_info >> 32) != 0:
                 continue
             relocations[r_offset] = r_addend & mask
@@ -386,7 +385,7 @@ class ElfImage:
 
 
 class GoImage:
-    """Locate the Go pclntab, moduledata and function table of an agy build."""
+    """Locate the Go pclntab, moduledata and function table of an Antigravity Go binary."""
 
     def __init__(self, elf):
         self.elf = elf
@@ -478,9 +477,7 @@ class GoImage:
         self.entries = []
         previous = -1
         for index in range(ftab_len):
-            entryoff, funcoff = struct.unpack_from(
-                "<II", data, table_offset + index * 8
-            )
+            entryoff, funcoff = struct.unpack_from("<II", data, table_offset + index * 8)
             if entryoff < previous:
                 fail("%s: function table is not sorted" % elf.path)
             previous = entryoff
@@ -500,9 +497,7 @@ class GoImage:
                 fail("%s: _func entry %d is not mapped" % (elf.path, index))
             recorded, _nameoff = struct.unpack_from("<Ii", data, func_offset)
             if recorded != entryoff:
-                fail(
-                    "%s: function table entry %d is inconsistent" % (elf.path, index)
-                )
+                fail("%s: function table entry %d is inconsistent" % (elf.path, index))
 
     def _parse_pc_header(self, offset):
         data = self.elf.data
@@ -556,9 +551,7 @@ class GoImage:
         found = {name: [] for name in wanted}
         for index in range(len(self.entries) - 1):
             entryoff, funcoff = self.entries[index]
-            func_offset = self.elf.va_to_off(
-                self._func_base_va + funcoff, 12
-            )
+            func_offset = self.elf.va_to_off(self._func_base_va + funcoff, 12)
             if func_offset is None:
                 fail("%s: _func entry %d is not mapped" % (self.elf.path, index))
             _entry, nameoff = struct.unpack_from("<Ii", self.elf.data, func_offset)
@@ -579,7 +572,7 @@ class GoImage:
 
 
 # --------------------------------------------------------------------------
-# patch analysis
+# Go binary patch analysis
 # --------------------------------------------------------------------------
 
 
@@ -605,14 +598,15 @@ def _jump_bytes(go, funcs, spec, source_va):
     return b"\xe9" + struct.pack("<i", displacement)
 
 
-def analyze(go):
-    """Return (state, edits, function map) where state is pristine|patched."""
-
-    wanted = {spec["symbol"] for spec in PATCH_SPECS} | {SYM_CONTEXT_WINDOW_CHOICE}
+def analyze_go_specs(go, specs):
+    wanted = {spec["symbol"] for spec in specs}
+    for spec in specs:
+        if "jump" in spec:
+            wanted.add(spec["jump"])
     funcs = go.find_functions(wanted)
     edits = []
     states = []
-    for spec in PATCH_SPECS:
+    for spec in specs:
         matches = funcs.get(spec["symbol"], [])
         if len(matches) != 1:
             fail(
@@ -667,7 +661,7 @@ def analyze(go):
                         new_hits,
                     )
                 )
-        else:  # head patch
+        else:
             new_bytes = spec.get("new")
             if new_bytes is None:
                 new_bytes = _jump_bytes(go, funcs, spec, function_va)
@@ -702,7 +696,7 @@ def analyze(go):
                 go.elf.path,
                 ", ".join(
                     "%s=%s" % (spec["symbol"].rsplit(".", 1)[-1], state_kind)
-                    for spec, state_kind in zip(PATCH_SPECS, states)
+                    for spec, state_kind in zip(specs, states)
                 ),
             )
         )
@@ -715,7 +709,495 @@ def analyze(go):
 
 
 # --------------------------------------------------------------------------
-# state directory / manifest / backups
+# ASAR reader & lossless rewriter (zero dependencies)
+# --------------------------------------------------------------------------
+
+
+def _asar_integrity(raw_bytes):
+    full_hash = hashlib.sha256(raw_bytes).hexdigest()
+    blocks = []
+    if not raw_bytes:
+        blocks.append(full_hash)
+    else:
+        for off in range(0, len(raw_bytes), ASAR_BLOCK_SIZE):
+            blocks.append(hashlib.sha256(raw_bytes[off : off + ASAR_BLOCK_SIZE]).hexdigest())
+    return {
+        "algorithm": "SHA256",
+        "hash": full_hash,
+        "blockSize": ASAR_BLOCK_SIZE,
+        "blocks": blocks,
+    }
+
+
+class AsarArchive:
+    """In-memory ASAR reader and selective-rewrite packer (preserves unpacked entries)."""
+
+    def __init__(self, path):
+        self.path = path
+        with open(path, "rb") as handle:
+            prefix = handle.read(16)
+            if len(prefix) != 16:
+                fail("%s: truncated ASAR header" % path)
+            u0, u1, u2, u3 = ASAR_PICKLE_HEADER.unpack(prefix)
+            if u0 != 4 or u1 < 8 or u2 != u1 - 4 or u3 > u2 - 4:
+                fail("%s: invalid ASAR pickle header" % path)
+            self.data_offset = 8 + u1
+            header_bytes = handle.read(u3)
+            if len(header_bytes) != u3:
+                fail("%s: truncated ASAR JSON directory" % path)
+        try:
+            self.header = json.loads(header_bytes.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError) as error:
+            fail("%s: malformed ASAR JSON header (%s)" % (path, error))
+        if not isinstance(self.header, dict) or "files" not in self.header:
+            fail("%s: invalid ASAR root node" % path)
+
+    def _lookup(self, rel_path):
+        node = self.header
+        for part in rel_path.split("/"):
+            files = node.get("files")
+            if not isinstance(files, dict) or part not in files:
+                return None
+            node = files[part]
+        return node
+
+    def read_bytes(self, rel_path):
+        node = self._lookup(rel_path)
+        if node is None or "files" in node or node.get("unpacked"):
+            return None
+        size = int(node["size"])
+        offset = int(node["offset"])
+        with open(self.path, "rb") as handle:
+            handle.seek(self.data_offset + offset)
+            data = handle.read(size)
+        if len(data) != size:
+            fail("%s: truncated ASAR entry %s" % (self.path, rel_path))
+        return data
+
+    def read_text(self, rel_path):
+        raw = self.read_bytes(rel_path)
+        if raw is None:
+            return None
+        try:
+            return raw.decode("utf-8")
+        except UnicodeDecodeError:
+            fail("%s: non-UTF-8 ASAR entry %s" % (self.path, rel_path))
+
+    def rewrite(self, target_path, replacements, source_stat):
+        """Write a new ASAR replacing packed files in replacements (rel_path -> bytes)."""
+        pending = dict(replacements)
+        file_plan = []
+        cursor = [0]
+
+        def clone_tree(node, prefix):
+            if "files" in node:
+                out_files = {}
+                for name, child in node["files"].items():
+                    child_path = f"{prefix}/{name}" if prefix else name
+                    out_files[name] = clone_tree(child, child_path)
+                return {"files": out_files}
+            entry = {}
+            if node.get("executable"):
+                entry["executable"] = True
+            if node.get("unpacked"):
+                if prefix in pending:
+                    fail("%s: refusing to rewrite unpacked ASAR entry %s" % (self.path, prefix))
+                entry["size"] = int(node["size"])
+                entry["unpacked"] = True
+                if "integrity" in node:
+                    entry["integrity"] = node["integrity"]
+                return entry
+
+            if prefix in pending:
+                raw = pending.pop(prefix)
+                size = len(raw)
+                entry["size"] = size
+                entry["offset"] = str(cursor[0])
+                entry["integrity"] = _asar_integrity(raw)
+                file_plan.append(("replace", raw, size))
+                cursor[0] += size
+            else:
+                size = int(node["size"])
+                src_off = int(node["offset"])
+                entry["size"] = size
+                entry["offset"] = str(cursor[0])
+                if "integrity" in node:
+                    entry["integrity"] = node["integrity"]
+                file_plan.append(("copy", src_off, size))
+                cursor[0] += size
+            return entry
+
+        new_header = clone_tree(self.header, "")
+        if pending:
+            fail("%s: missing ASAR entries for replacement: %s" % (self.path, ", ".join(sorted(pending))))
+
+        header_json = json.dumps(new_header, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+        pad_len = (-len(header_json)) % 4
+        padded_len = len(header_json) + pad_len
+        pickle_bytes = ASAR_PICKLE_HEADER.pack(4, padded_len + 8, padded_len + 4, len(header_json))
+
+        with open(self.path, "rb") as src, open(target_path, "wb") as dst:
+            dst.write(pickle_bytes)
+            dst.write(header_json)
+            if pad_len:
+                dst.write(b"\x00" * pad_len)
+            for kind, arg, size in file_plan:
+                if kind == "replace":
+                    dst.write(arg)
+                else:
+                    src.seek(self.data_offset + arg)
+                    _copy_range(src, dst, size)
+            dst.flush()
+            os.fsync(dst.fileno())
+        os.chmod(target_path, stat.S_IMODE(source_stat.st_mode))
+        try:
+            os.chown(target_path, source_stat.st_uid, source_stat.st_gid)
+        except (PermissionError, AttributeError):
+            pass
+
+
+# --------------------------------------------------------------------------
+# Desktop zh-CN patch definitions & analyzer
+# --------------------------------------------------------------------------
+
+ZH_INJECT_MARKER = "// ===== agy-patch zh-CN localization engine v1 ====="
+MENU_INJECT_MARKER = "// ===== agy-patch menu zh-CN ====="
+CTX_INJECT_MARKER = "// ===== agy-patch context menu zh-CN ====="
+
+MENU_HELPER_JS = """
+// ===== agy-patch menu zh-CN =====
+const agyMenuZhMap = {
+  'File': '文件',
+  'Edit': '编辑',
+  'View': '视图',
+  'Window': '窗口',
+  'Help': '帮助',
+  'New Window': '新建窗口',
+  'Docs': '使用文档',
+  'Toggle Developer Tools': '开发者工具',
+  'Check for Updates': '检查更新',
+  'Checking for Updates...': '正在检查更新...',
+  'Downloading Update...': '正在下载更新...',
+  'Restart to Update': '重启以应用更新',
+  'Undo': '撤销',
+  'Redo': '重做',
+  'Cut': '剪切',
+  'Copy': '复制',
+  'Paste': '粘贴',
+  'Select All': '全选',
+  'Minimize': '最小化',
+  'Close': '关闭',
+  'Quit Antigravity': '退出 Antigravity',
+  'About Antigravity': '关于 Antigravity',
+  'Services': '服务',
+  'Hide Antigravity': '隐藏 Antigravity',
+  'Hide Others': '隐藏其他',
+  'Show All': '显示全部',
+  'Force Reload': '强制重新加载',
+  'Reload': '重新加载',
+  'Actual Size': '实际大小',
+  'Zoom In': '放大',
+  'Zoom Out': '缩小',
+  'Toggle Full Screen': '切换全屏',
+  'Toggle Fullscreen': '切换全屏',
+  'Reset Zoom': '重置缩放',
+  'Connect to WSL': '连接到 WSL',
+  'Reopen Locally': '本地重新打开',
+};
+function agyTranslateMenu(menuItem) {
+  if (menuItem && menuItem.label && agyMenuZhMap[menuItem.label]) {
+    menuItem.label = agyMenuZhMap[menuItem.label];
+  }
+  if (menuItem && menuItem.submenu) {
+    const items = menuItem.submenu.items || (Array.isArray(menuItem.submenu) ? menuItem.submenu : null);
+    if (items) items.forEach(agyTranslateMenu);
+  }
+}
+"""
+
+CONTEXT_MENU_HELPER_JS = """
+// ===== agy-patch context menu zh-CN =====
+const agyCtxMenuZhMap = {
+  'Cut': '剪切',
+  'Copy': '复制',
+  'Paste': '粘贴',
+  'Select All': '全选',
+  'Undo': '撤销',
+  'Redo': '重做',
+  'Delete': '删除',
+  'Copy Project Name': '复制项目名称',
+  'Copy Project Path': '复制项目路径',
+  'Project Settings': '项目设置',
+  'Delete Project': '删除项目',
+  'Rename Project': '重命名项目',
+  'Open Project': '打开项目',
+  'Open Folder': '打开文件夹',
+  'New Folder': '新建文件夹',
+  'Remove Project': '移除项目',
+  'Remove from List': '从列表中移除',
+  'Project options': '项目选项',
+  'New Conversation': '新建对话',
+  'Fork Conversation': '派生对话',
+  'Rename': '重命名',
+  'Pin': '置顶',
+  'Unpin': '取消置顶',
+  'Auto Pin': '自动置顶',
+  'Mark Unread': '标为未读',
+  'Mark Read': '标为已读',
+  'Mark as Unread': '标为未读',
+  'Mark as Read': '标为已读',
+  'Split': '分屏',
+  'Split Conversation': '拆分对话',
+  'Stop': '停止',
+  'Stop Agent': '停止智能体',
+  'Resume': '恢复',
+  'Restart': '重新启动',
+  'Close': '关闭',
+  'Close Others': '关闭其他',
+  'Close All': '全部关闭',
+  'Copy Path': '复制路径',
+  'Copy Relative Path': '复制相对路径',
+  'Reveal in File Explorer': '在文件资源管理器中显示',
+  'Reveal in Finder': '在访达中显示',
+  'Open in Terminal': '在终端中打开',
+  'View Usage': '查看使用额度',
+  'Duplicate': '创建副本',
+  'Archive': '归档',
+  'Archive Conversation': '归档对话',
+  'Unarchive': '取消归档',
+  'Unarchive Conversation': '取消归档对话',
+  'Share': '分享',
+  'Copy Link': '复制链接',
+  'Export': '导出',
+  'Export Conversation': '导出对话',
+  'Clear': '清除',
+  'Clear History': '清除历史',
+  'Automations': '自动化',
+  'Automation': '自动化',
+  'Give Feedback': '提供反馈',
+  'Provide Feedback': '提供反馈',
+  'Sort By': '排序方式',
+  'Sort by': '排序方式',
+  'Last Updated': '最近更新',
+  'Last Prompt': '最新提示词',
+  'Custom Order': '自定义排序',
+  'Quote': '引用',
+  'Quote Ctrl+L': '引用 Ctrl+L',
+  'Quote Cmd+L': '引用 Cmd+L',
+  'Conversation Name': '对话名称',
+  'Conversation ID': '对话 ID',
+  'Project Name': '项目名称',
+  'Project Path': '项目路径',
+  'Workspace Name': '工作区名称',
+  'Workspace Path': '工作区路径',
+  'Conversation Path': '对话路径',
+  'Split Right': '向右分屏',
+  'Split Down': '向下分屏',
+  'Split Left': '向左分屏',
+  'Split Up': '向上分屏',
+  'Replace with New': '替换为新建',
+  'Replace With New': '替换为新建',
+  'Replace with new': '替换为新建',
+  'Ask /btw': '通过 /btw 提问',
+};
+function agyTranslateCtxLabel(lbl) {
+  if (!lbl) return '';
+  const s = typeof lbl === 'string' ? lbl.trim() : '';
+  return agyCtxMenuZhMap[lbl] || agyCtxMenuZhMap[s] || lbl;
+}
+"""
+
+ASAR_NATIVE_REPLACEMENTS = [
+    (
+        "dist/menu.js",
+        "const submenuItem = appMenu.items.find((item) => item.label === submenuLabel);",
+        "const submenuItem = appMenu.items.find((item) => item.label === submenuLabel || (typeof agyMenuZhMap !== 'undefined' && item.label === agyMenuZhMap[submenuLabel]));",
+        1,
+    ),
+    (
+        "dist/menu.js",
+        "electron_1.Menu.setApplicationMenu(menu);",
+        "if (typeof agyTranslateMenu === 'function') { menu.items.forEach(agyTranslateMenu); } electron_1.Menu.setApplicationMenu(menu);",
+        2,
+    ),
+    (
+        "dist/tray.js",
+        "countItem.label =\n                (count > 0 ? `${count}` : 'No') +\n                    ' agent' +\n                    (count === 1 ? '' : 's') +\n                    ' running';",
+        "countItem.label = count > 0 ? `${count} 个智能体运行中` : '没有智能体在运行';",
+        1,
+    ),
+    (
+        "dist/tray.js",
+        "contextMenu = electron_1.Menu.buildFromTemplate(actions);",
+        "const translatedActions = actions.map((action) => { const copy = { ...action }; if (copy.label === 'No agents running') copy.label = '没有智能体在运行'; if (copy.label && copy.label.startsWith('Open ')) copy.label = '打开 Antigravity'; if (copy.label === 'Quit') copy.label = '退出'; return copy; }); contextMenu = electron_1.Menu.buildFromTemplate(translatedActions);",
+        1,
+    ),
+    ("dist/ipcHandlers.js", "title: 'Open workspace',", "title: '打开工作区',", 1),
+    ("dist/ipcHandlers.js", "title: 'Open workspaces',", "title: '打开多个工作区',", 1),
+    ("dist/ipcHandlers.js", "electron_1.dialog.showErrorBox('Cannot open folder', t.error);", "electron_1.dialog.showErrorBox('无法打开文件夹', t.error);", 1),
+    ("dist/ipcHandlers.js", "message: 'Folder is on the Windows filesystem',", "message: '文件夹位于 Windows 文件系统中',", 1),
+    ("dist/ipcHandlers.js", "label: item.label ?? '',", "label: (typeof agyTranslateCtxLabel === 'function' ? agyTranslateCtxLabel(item.label) : item.label) ?? '',", 2),
+    ("dist/main.js", "title: 'Confirm Quit',", "title: '确认退出',", 1),
+    ("dist/main.js", "message: 'Are you sure you want to quit?',", "message: '您确定要退出吗？',", 1),
+    ("dist/main.js", "detail: 'There may be agents or background tasks running.',", "detail: '可能还有智能体或后台任务正在运行。',", 1),
+    ("dist/main.js", "buttons: ['Cancel', 'Quit'],", "buttons: ['取消', '退出'],", 1),
+    ("dist/main.js", "label: 'New Window',", "label: '新建窗口',", 1),
+    ("dist/main.js", "await electron_1.dialog.showErrorBox('WSL setup failed', msg);", "await electron_1.dialog.showErrorBox('WSL 配置失败', msg);", 1),
+    ("dist/main.js", "await electron_1.dialog.showErrorBox('Startup failed', msg);", "await electron_1.dialog.showErrorBox('启动失败', msg);", 1),
+    ("dist/main.js", "await electron_1.dialog.showErrorBox('Binary not found', msg);", "await electron_1.dialog.showErrorBox('未找到核心二进制组件', msg);", 1),
+    ("dist/updater.js", "title: 'Check for Updates',", "title: '检查更新',", 1),
+    ("dist/updater.js", "message: 'No updates available',", "message: '当前已是最新版本，暂无可用更新。',", 1),
+    ("dist/updater.js", "buttons: ['OK'],", "buttons: ['确定'],", 1),
+    ("dist/ideInstall/wizardHtml.js", "<title>Welcome to Antigravity</title>", "<title>欢迎使用 Antigravity</title>", 1),
+    ("dist/ideInstall/wizardHtml.js", "Setting up…", "正在配置…", 1),
+    ("dist/ideInstall/wizardHtml.js", "<h1>Welcome to the new Antigravity!</h1>", "<h1>欢迎使用全新 Antigravity！</h1>", 1),
+    ("dist/ideInstall/wizardHtml.js", "<span>Download the Antigravity IDE</span>", "<span>下载 Antigravity IDE</span>", 1),
+    ("dist/ideInstall/wizardHtml.js", '<button class="btn-primary" id="btn-skip">Explore the new Antigravity</button>', '<button class="btn-primary" id="btn-skip">探索全新 Antigravity</button>', 1),
+    ("dist/deviceChooser.js", "hid: 'HID device',", "hid: 'HID 设备',", 1),
+    ("dist/deviceChooser.js", "usb: 'USB device',", "usb: 'USB 设备',", 1),
+    ("dist/deviceChooser.js", "serial: 'serial port',", "serial: '串行端口',", 1),
+    ("dist/deviceChooser.js", "title: 'Connect a device',", "title: '连接设备',", 1),
+    ("dist/deviceChooser.js", "buttons: [...snapshot.map(({ label }) => label), 'Cancel'],", "buttons: [...snapshot.map(({ label }) => label), '取消'],", 1),
+    ("dist/webviewPopupSecurity.js", "insecure: 'Not secure',", "insecure: '不安全',", 1),
+    ("dist/webviewPopupSecurity.js", "dangerous: '⚠ Not secure',", "dangerous: '⚠ 不安全',", 1),
+    ("dist/webviewPopupSecurity.js", "'Your connection to this site is not secure',", "'您与此网站的连接不安全',", 1),
+    ("dist/webviewPopupSecurity.js", "'Connection is secure',", "'连接安全',", 1),
+    ("dist/webviewPopupSecurity.js", "neutral: ['Connection security information is not available for this page'],", "neutral: ['无法获取此页面的连接安全信息'],", 1),
+    ("dist/webviewPopupSecurity.js", "label: 'Connection info…',", "label: '连接信息…',", 1),
+    ("dist/webviewPopupSecurity.js", "title: 'Connection info',", "title: '连接信息',", 1),
+    ("dist/webviewPopupSecurity.js", "buttons: ['OK'],", "buttons: ['确定'],", 1),
+    ("dist/webauthn.js", "title: 'Choose a Passkey',", "title: '选择通行密钥',", 1),
+    ("dist/webauthn.js", "detail: 'Select a passkey account to continue:',", "detail: '请选择一个通行密钥账户以继续：',", 1),
+    ("dist/webauthn.js", "buttons: [...accountLabels, 'Cancel'],", "buttons: [...accountLabels, '取消'],", 1),
+    ("dist/cablev2.js", "<title>Passkeys</title>", "<title>通行密钥</title>", 1),
+    ("dist/cablev2.js", "modal?.updateStatus('Connecting to your device…');", "modal?.updateStatus('正在连接你的设备…');", 1),
+    ("dist/cablev2.js", "modal?.updateStatus('Verify on your device to continue…');", "modal?.updateStatus('请在你的设备上验证以继续…');", 1),
+    ("dist/remote/disconnectedPage.js", "const title = connecting ? 'Reconnecting…' : 'Disconnected';", "const title = connecting ? '正在重新连接…' : '已断开连接';", 1),
+    ("dist/remote/disconnectedPage.js", '<a class="button primary" href="${action(\'reconnect\')}">Reconnect</a>', '<a class="button primary" href="${action(\'reconnect\')}">重新连接</a>', 1),
+    ("dist/remote/disconnectedPage.js", '<a class="button" href="${action(\'close\')}">Close</a>', '<a class="button" href="${action(\'close\')}">关闭</a>', 1),
+    ("dist/remote/sshPrompts.js", '<div class="buttons"><button id="cancel">Cancel</button><button id="continue">Continue</button></div>', '<div class="buttons"><button id="cancel">取消</button><button id="continue">继续</button></div>', 1),
+    ("dist/remote/sshPrompts.js", "buttons: confirm ? ['Yes', 'No'] : ['Cancel'],", "buttons: confirm ? ['是', '否'] : ['取消'],", 1),
+    ("dist/remote/remoteManager.js", "title: 'Choose an SSH config file',", "title: '选择 SSH 配置文件',", 1),
+    ("dist/remote/remoteManager.js", "title: 'Stop SSH server',", "title: '停止 SSH 服务端',", 2),
+    ("dist/remote/remoteManager.js", "buttons: ['Stop Server', 'Cancel'],", "buttons: ['停止服务端', '取消'],", 1),
+    ("dist/remote/remoteManager.js", "buttons: ['Sign In', 'Cancel'],", "buttons: ['登录', '取消'],", 1),
+]
+
+
+def _repo_root():
+    return os.path.dirname(os.path.realpath(__file__))
+
+
+def load_zh_assets():
+    root = _repo_root()
+    dict_path = os.path.join(root, "dicts", "zh-CN.json")
+    engine_path = os.path.join(root, "assets", "zh-cn-engine.js")
+    if not os.path.exists(dict_path):
+        fail("localization dictionary missing: %s" % dict_path)
+    if not os.path.exists(engine_path):
+        fail("localization engine missing: %s" % engine_path)
+    with open(dict_path, "r", encoding="utf-8") as handle:
+        dict_payload = json.load(handle)
+    with open(engine_path, "r", encoding="utf-8") as handle:
+        engine_tpl = handle.read()
+    if "__AGY_DICT_JSON__" not in engine_tpl or "__AGY_CORE_WORDS_JSON__" not in engine_tpl:
+        fail("localization engine template is missing placeholders: %s" % engine_path)
+    engine_js = (
+        engine_tpl.replace(
+            "__AGY_DICT_JSON__",
+            json.dumps(dict_payload["dictionary"], ensure_ascii=False),
+        ).replace(
+            "__AGY_CORE_WORDS_JSON__",
+            json.dumps(dict_payload["coreWords"], ensure_ascii=False),
+        )
+    )
+    return dict_payload, engine_js
+
+
+def analyze_asar_zh(asar_archive, engine_js=None):
+    """Return (state, replacements_dict_or_none, summary_dict) for app.asar."""
+    preload = asar_archive.read_text("dist/preload.js")
+    wizard = asar_archive.read_text("dist/ideInstall/wizardPreload.js")
+    menu_js = asar_archive.read_text("dist/menu.js")
+    ipc_js = asar_archive.read_text("dist/ipcHandlers.js")
+    if preload is None or wizard is None or menu_js is None or ipc_js is None:
+        fail("%s: missing expected Electron preload/menu/ipcHandlers files" % asar_archive.path)
+
+    pkg_raw = asar_archive.read_text("package.json")
+    app_version = "?"
+    if pkg_raw:
+        try:
+            app_version = json.loads(pkg_raw).get("version", "?")
+        except ValueError:
+            pass
+
+    files_cache = {
+        "dist/preload.js": preload,
+        "dist/ideInstall/wizardPreload.js": wizard,
+        "dist/menu.js": menu_js,
+        "dist/ipcHandlers.js": ipc_js,
+    }
+    for rel_path, _old, _new, _cnt in ASAR_NATIVE_REPLACEMENTS:
+        if rel_path not in files_cache:
+            txt = asar_archive.read_text(rel_path)
+            if txt is None:
+                fail("%s: missing expected ASAR entry %s" % (asar_archive.path, rel_path))
+            files_cache[rel_path] = txt
+
+    markers_present = [
+        ZH_INJECT_MARKER in preload,
+        ZH_INJECT_MARKER in wizard,
+        MENU_INJECT_MARKER in menu_js,
+        CTX_INJECT_MARKER in ipc_js,
+    ]
+    replacement_states = []
+    for rel_path, old, new, expected_count in ASAR_NATIVE_REPLACEMENTS:
+        txt = files_cache[rel_path]
+        new_cnt = txt.count(new)
+        old_cnt = txt.replace(new, "").count(old)
+        if old_cnt == expected_count and new_cnt == 0:
+            replacement_states.append("old")
+        elif old_cnt == 0 and new_cnt == expected_count:
+            replacement_states.append("new")
+        else:
+            fail(
+                "%s: %s anchor mismatch for %r (old=%d new=%d expected=%d)"
+                % (asar_archive.path, rel_path, old[:48], old_cnt, new_cnt, expected_count)
+            )
+
+    if not any(markers_present) and all(s == "old" for s in replacement_states):
+        state = "pristine"
+    elif all(markers_present) and all(s == "new" for s in replacement_states):
+        state = "patched"
+    else:
+        fail("%s: mixed or partial zh-CN localization state" % asar_archive.path)
+
+    replacements = None
+    if state == "pristine" and engine_js is not None:
+        updated = dict(files_cache)
+        updated["dist/preload.js"] = updated["dist/preload.js"] + "\n" + engine_js + "\n"
+        updated["dist/ideInstall/wizardPreload.js"] = (
+            updated["dist/ideInstall/wizardPreload.js"] + "\n" + engine_js + "\n"
+        )
+        updated["dist/menu.js"] = updated["dist/menu.js"] + "\n" + MENU_HELPER_JS + "\n"
+        updated["dist/ipcHandlers.js"] = (
+            updated["dist/ipcHandlers.js"] + "\n" + CONTEXT_MENU_HELPER_JS + "\n"
+        )
+        for rel_path, old, new, expected_count in ASAR_NATIVE_REPLACEMENTS:
+            assert updated[rel_path].count(old) == expected_count
+            updated[rel_path] = updated[rel_path].replace(old, new)
+        replacements = {k: v.encode("utf-8") for k, v in updated.items()}
+
+    summary = {
+        "app_version": app_version,
+        "native_edits": len(ASAR_NATIVE_REPLACEMENTS),
+        "injected_files": 2 + len({r[0] for r in ASAR_NATIVE_REPLACEMENTS}),
+    }
+    return state, replacements, summary
+
+
+# --------------------------------------------------------------------------
+# state directory / manifest / backups / process guard
 # --------------------------------------------------------------------------
 
 
@@ -744,19 +1226,19 @@ def load_manifest(state_dir, real_path):
     if manifest.get("schema") != 1:
         fail("%s: unsupported manifest schema" % path)
     if manifest.get("binary") != real_path:
-        fail("%s: manifest belongs to another binary" % path)
+        fail("%s: manifest belongs to another file" % path)
     manifest["_path"] = path
     return manifest
 
 
-def ensure_backup(real_path, state_dir, original_sha, source_stat):
+def ensure_backup(real_path, state_dir, original_sha, source_stat, ext=".bin"):
     backup_dir = os.path.join(state_dir, "backups")
     os.makedirs(backup_dir, exist_ok=True)
-    backup_path = os.path.join(backup_dir, original_sha + ".bin")
+    backup_path = os.path.join(backup_dir, original_sha + ext)
     if os.path.exists(backup_path):
         if sha256_file(backup_path) != original_sha:
             fail(
-                "%s: existing backup does not match the original binary; "
+                "%s: existing backup does not match the original file; "
                 "refusing to overwrite it" % backup_path
             )
         return backup_path
@@ -786,8 +1268,27 @@ def assert_unchanged(real_path, original_stat, original_sha):
         fail("%s content changed while patching; aborting" % real_path)
 
 
+def check_desktop_not_running(desktop_dir):
+    real_desktop = os.path.realpath(desktop_dir)
+    if not os.path.isdir("/proc"):
+        return
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        exe_link = os.path.join("/proc", entry, "exe")
+        try:
+            exe_target = os.path.realpath(exe_link)
+        except OSError:
+            continue
+        if exe_target == real_desktop or exe_target.startswith(real_desktop + os.sep):
+            fail(
+                "Antigravity Desktop is currently running (pid %s: %s); "
+                "close it completely before patching or restoring" % (entry, exe_target)
+            )
+
+
 # --------------------------------------------------------------------------
-# commands
+# target discovery
 # --------------------------------------------------------------------------
 
 
@@ -811,55 +1312,102 @@ def resolve_binary(argument, allow_symlink):
     return path, os.path.realpath(path)
 
 
-def command_status(args):
-    path, real = resolve_binary(args.binary, allow_symlink=True)
-    real_stat = os.stat(real)
-    digest = sha256_file(real)
-    with open(real, "rb") as handle:
-        mapping = mmap.mmap(handle.fileno(), 0, access=mmap.ACCESS_READ)
-        try:
-            elf = ElfImage(real, mapping)
-            go = GoImage(elf)
-            state, _edits, _funcs = analyze(go)
-            summary = go.summary()
-        finally:
-            mapping.close()
-
-    print("binary:   %s" % real)
-    print("sha256:   %s" % digest)
-    if real != path:
-        print("symlink:  %s -> %s" % (path, real))
-    print(
-        "go table: %d functions, %d files, text=%s, etext=%s"
-        % (
-            summary["functions"],
-            summary["files"],
-            summary["text"],
-            summary["etext"],
-        )
+def _is_desktop_dir(path):
+    if not path or not os.path.isdir(path):
+        return False
+    return (
+        os.path.isfile(os.path.join(path, "resources", "app.asar"))
+        and os.path.isfile(os.path.join(path, "resources", "bin", "language_server"))
     )
-    if state == "pristine":
-        print("state:    pristine (%s; not patched)" % (
-            "verified agy " + KNOWN_BUILDS[digest] if digest in KNOWN_BUILDS
-            else "signature-compatible, UNVERIFIED build"
-        ))
-    else:
-        print("state:    patched (%d byte edits present)" % len(PATCH_SPECS))
 
-    state_dir = state_directory()
+
+def resolve_desktop_dir(argument):
+    if argument:
+        cand = os.path.abspath(argument)
+        if _is_desktop_dir(cand):
+            return os.path.realpath(cand)
+        parent = os.path.dirname(cand)
+        if os.path.basename(cand) == "resources" and _is_desktop_dir(parent):
+            return os.path.realpath(parent)
+        fail("%s: not an Antigravity Desktop directory (missing resources/app.asar or resources/bin/language_server)" % cand)
+
+    candidates = [
+        os.path.expanduser("~/.local/opt/antigravity"),
+        "/opt/antigravity",
+        "/opt/Antigravity",
+        "/usr/lib/antigravity",
+        "/usr/share/antigravity",
+    ]
+    which_ag = shutil.which("antigravity")
+    if which_ag:
+        real_ag = os.path.realpath(which_ag)
+        candidates.insert(0, os.path.dirname(real_ag))
+        if os.path.isfile(real_ag) and os.path.getsize(real_ag) < 16384:
+            try:
+                with open(real_ag, "r", encoding="utf-8", errors="ignore") as f:
+                    txt = f.read()
+                for line in txt.splitlines():
+                    if "APP_DIR=" in line and '"' in line:
+                        val = line.split('"', 2)[1].replace("$HOME", os.path.expanduser("~"))
+                        candidates.insert(0, val)
+            except OSError:
+                pass
+    for cand in candidates:
+        if _is_desktop_dir(cand):
+            return os.path.realpath(cand)
+    fail("Antigravity Desktop was not found; pass --desktop-dir PATH")
+
+
+def expand_targets(args):
+    target = args.target
+    if target == "auto":
+        if args.binary:
+            return ["cli"]
+        if args.desktop_dir:
+            return ["desktop-context", "desktop-zh"]
+        selected = []
+        if shutil.which("agy"):
+            selected.append("cli")
+        try:
+            resolve_desktop_dir(None)
+            selected.extend(["desktop-context", "desktop-zh"])
+        except PatchError:
+            pass
+        if not selected:
+            fail("neither agy CLI nor Antigravity Desktop was found; pass --binary or --desktop-dir")
+        return selected
+    if target == "cli":
+        return ["cli"]
+    if target == "desktop-context":
+        return ["desktop-context"]
+    if target == "desktop-zh":
+        return ["desktop-zh"]
+    if target == "desktop":
+        return ["desktop-context", "desktop-zh"]
+    if target == "all":
+        return ["cli", "desktop-context", "desktop-zh"]
+    fail("unknown target: %s" % target)
+
+
+# --------------------------------------------------------------------------
+# shared status / apply / restore helpers for Go ELF targets
+# --------------------------------------------------------------------------
+
+
+def _print_manifest_status(state_dir, real, state, digest):
     manifest = load_manifest(state_dir, real)
     if manifest is None:
         print("manifest: none")
-        return 0
+        return
     print("manifest: %s" % manifest["_path"])
     print("  created: %s" % manifest.get("created_at", "?"))
     if state == "patched":
         if digest == manifest.get("patched_sha256"):
             print("  status:  verified against this build")
         else:
-            print("  status:  STALE (binary hash does not match manifest)")
+            print("  status:  STALE (file hash does not match manifest)")
     else:
-        print("  status:  stale (binary is not the patched build)")
+        print("  status:  stale (file is not the patched build)")
     backup_path = manifest.get("backup", "")
     if os.path.exists(backup_path):
         if sha256_file(backup_path) == manifest.get("original_sha256"):
@@ -870,9 +1418,6 @@ def command_status(args):
         print("backup:   %s (missing)" % backup_path)
     print("original: %s" % manifest.get("original_sha256", "?"))
     print("patched:  %s" % manifest.get("patched_sha256", "?"))
-    if not os.path.exists(manifest["_path"]):
-        print("warning: manifest disappeared during status")
-    return 0
 
 
 def _print_edits(edits):
@@ -889,8 +1434,38 @@ def _print_edits(edits):
         )
 
 
-def command_apply(args):
-    path, real = resolve_binary(args.binary, allow_symlink=False)
+def _go_status(label, path, real, known_builds, specs):
+    digest = sha256_file(real)
+    with open(real, "rb") as handle:
+        mapping = mmap.mmap(handle.fileno(), 0, access=mmap.ACCESS_READ)
+        try:
+            elf = ElfImage(real, mapping)
+            go = GoImage(elf)
+            state, _edits, _funcs = analyze_go_specs(go, specs)
+            summary = go.summary()
+        finally:
+            mapping.close()
+
+    print("[%s]" % label)
+    print("binary:   %s" % real)
+    print("sha256:   %s" % digest)
+    if real != path:
+        print("symlink:  %s -> %s" % (path, real))
+    print(
+        "go table: %d functions, %d files, text=%s, etext=%s"
+        % (summary["functions"], summary["files"], summary["text"], summary["etext"])
+    )
+    if state == "pristine":
+        print("state:    pristine (%s; not patched)" % (
+            "verified " + known_builds[digest] if digest in known_builds
+            else "signature-compatible, UNVERIFIED build"
+        ))
+    else:
+        print("state:    patched (%d byte edits present)" % len(specs))
+    _print_manifest_status(state_directory(), real, state, digest)
+
+
+def _go_apply(label, real, known_builds, specs, dry_run, desktop_dir=None):
     source_stat = os.lstat(real)
     current_sha = sha256_file(real)
     state_dir = state_directory()
@@ -901,48 +1476,40 @@ def command_apply(args):
         try:
             elf = ElfImage(real, mapping)
             go = GoImage(elf)
-            state, edits, _funcs = analyze(go)
+            state, edits, _funcs = analyze_go_specs(go, specs)
             summary = go.summary()
         finally:
             mapping.close()
 
+    print("[%s]" % label)
     if state == "patched":
         if manifest is None:
-            fail(
-                "%s: binary is already patched but the manifest is missing; "
-                "refusing to continue" % real
-            )
+            fail("%s: binary is already patched but the manifest is missing; refusing to continue" % real)
         if current_sha != manifest.get("patched_sha256"):
-            fail(
-                "%s: binary is patched but does not match the manifest; "
-                "refusing to continue" % real
-            )
+            fail("%s: binary is patched but does not match the manifest; refusing to continue" % real)
         print("already patched: %s" % real)
         print("sha256:          %s (matches manifest)" % current_sha)
-        return 0
-    if current_sha not in KNOWN_BUILDS:
+        return
+    if current_sha not in known_builds:
         fail("%s: unverified original SHA256 %s; refusing unknown build" % (real, current_sha))
     if manifest is not None and manifest.get("original_sha256") != current_sha:
-        print(
-            "warning: an older manifest exists for a different build; "
-            "it will be replaced"
-        )
+        print("warning: an older manifest exists for a different build; it will be replaced")
+
+    if desktop_dir and not dry_run:
+        check_desktop_not_running(desktop_dir)
 
     original_sha = current_sha
     patched_sha = sha256_with_edits(real, edits)
     print("binary:   %s" % real)
-    print(
-        "go table: %d functions, text=%s"
-        % (summary["functions"], summary["text"])
-    )
+    print("go table: %d functions, text=%s" % (summary["functions"], summary["text"]))
     print("edits:    %d byte replacements" % len(edits))
     _print_edits(edits)
     print("sha256:   %s -> %s" % (original_sha, patched_sha))
-    if args.dry_run:
+    if dry_run:
         print("dry-run:  no files were written")
-        return 0
+        return
 
-    backup_path = ensure_backup(real, state_dir, original_sha, source_stat)
+    backup_path = ensure_backup(real, state_dir, original_sha, source_stat, ext=".bin")
     print("backup:   %s (sha256 verified)" % backup_path)
 
     directory = os.path.dirname(real)
@@ -965,6 +1532,7 @@ def command_apply(args):
     manifest_payload = {
         "schema": 1,
         "tool": "agy-patch",
+        "target": label,
         "binary": real,
         "binary_size": source_stat.st_size,
         "original_sha256": original_sha,
@@ -984,42 +1552,24 @@ def command_apply(args):
             for edit in edits
         ],
     }
-    try:
-        atomic_write_json(manifest_path(state_dir, real), manifest_payload)
-    except OSError as error:
-        print(
-            "error: binary was patched but the manifest could not be written: %s"
-            % error,
-            file=sys.stderr,
-        )
-        print(
-            "       backup: %s\n       original sha256: %s\n"
-            "       patched sha256:  %s\n"
-            "       restore manually from the backup after verifying its hash."
-            % (backup_path, original_sha, patched_sha),
-            file=sys.stderr,
-        )
-        return 1
+    atomic_write_json(manifest_path(state_dir, real), manifest_payload)
     print("patched:  %s" % real)
     print("manifest: %s" % manifest_path(state_dir, real))
-    print("restore:  agy-patch restore --binary %s" % real)
-    return 0
 
 
-def command_restore(args):
-    path, real = resolve_binary(args.binary, allow_symlink=False)
+def _restore_file_from_manifest(label, real, desktop_dir=None):
     state_dir = state_directory()
     manifest = load_manifest(state_dir, real)
+    print("[%s]" % label)
     if manifest is None:
         fail("%s: no manifest found; nothing to restore" % real)
     live_sha = sha256_file(real)
     if live_sha == manifest.get("original_sha256"):
-        fail("%s: binary already matches the original; nothing to restore" % real)
+        fail("%s: file already matches the original; nothing to restore" % real)
     if live_sha != manifest.get("patched_sha256"):
         fail(
-            "%s: live binary hash %s does not match the patched hash in the "
-            "manifest; refusing to overwrite a binary changed after patching"
-            % (real, live_sha)
+            "%s: live file hash %s does not match the patched hash in the manifest; "
+            "refusing to overwrite a file changed after patching" % (real, live_sha)
         )
     backup_path = manifest.get("backup", "")
     if not os.path.exists(backup_path):
@@ -1027,9 +1577,12 @@ def command_restore(args):
     backup_sha = sha256_file(backup_path)
     if backup_sha != manifest.get("original_sha256"):
         fail(
-            "%s: backup checksum mismatch (expected %s, got %s); refusing to "
-            "restore" % (backup_path, manifest.get("original_sha256"), backup_sha)
+            "%s: backup checksum mismatch (expected %s, got %s); refusing to restore"
+            % (backup_path, manifest.get("original_sha256"), backup_sha)
         )
+    if desktop_dir:
+        check_desktop_not_running(desktop_dir)
+
     current_stat = os.lstat(real)
     directory = os.path.dirname(real)
     temp_path = temp_in_dir(directory, ".agy-restore-")
@@ -1058,6 +1611,178 @@ def command_restore(args):
     print("restored: %s" % real)
     print("sha256:   %s (original)" % final_sha)
     print("backup:   %s (kept)" % backup_path)
+
+
+# --------------------------------------------------------------------------
+# Desktop zh-CN commands
+# --------------------------------------------------------------------------
+
+
+def _zh_status(asar_path):
+    digest = sha256_file(asar_path)
+    archive = AsarArchive(asar_path)
+    state, _replacements, summary = analyze_asar_zh(archive, engine_js=None)
+    print("[desktop-zh]")
+    print("asar:     %s" % asar_path)
+    print("app:      Antigravity %s" % summary["app_version"])
+    print("sha256:   %s" % digest)
+    if state == "pristine":
+        print("state:    pristine (%s; not patched)" % (
+            "verified " + KNOWN_ASAR_BUILDS[digest] if digest in KNOWN_ASAR_BUILDS
+            else "anchor-compatible, UNVERIFIED build"
+        ))
+    else:
+        print("state:    patched (zh-CN DOM engine + %d native UI edits)" % summary["native_edits"])
+    _print_manifest_status(state_directory(), asar_path, state, digest)
+
+
+def _zh_apply(desktop_dir, asar_path, dry_run):
+    source_stat = os.lstat(asar_path)
+    current_sha = sha256_file(asar_path)
+    state_dir = state_directory()
+    manifest = load_manifest(state_dir, asar_path)
+
+    archive = AsarArchive(asar_path)
+    dict_payload, engine_js = load_zh_assets()
+    state, replacements, summary = analyze_asar_zh(archive, engine_js=engine_js)
+
+    print("[desktop-zh]")
+    if state == "patched":
+        if manifest is None:
+            fail("%s: app.asar is already patched but the manifest is missing; refusing to continue" % asar_path)
+        if current_sha != manifest.get("patched_sha256"):
+            fail("%s: app.asar is patched but does not match the manifest; refusing to continue" % asar_path)
+        print("already patched: %s" % asar_path)
+        print("sha256:          %s (matches manifest)" % current_sha)
+        return
+    if current_sha not in KNOWN_ASAR_BUILDS:
+        fail("%s: unverified original SHA256 %s; refusing unknown build" % (asar_path, current_sha))
+    if manifest is not None and manifest.get("original_sha256") != current_sha:
+        print("warning: an older manifest exists for a different build; it will be replaced")
+
+    if not dry_run:
+        check_desktop_not_running(desktop_dir)
+
+    print("asar:     %s" % asar_path)
+    print("app:      Antigravity %s" % summary["app_version"])
+    print(
+        "dict:     %d entries + %d core words"
+        % (len(dict_payload["dictionary"]), len(dict_payload["coreWords"]))
+    )
+    print(
+        "edits:    2 preload injections + %d native Electron UI replacements (%d files)"
+        % (summary["native_edits"], summary["injected_files"])
+    )
+    if dry_run:
+        print("sha256:   %s (dry-run; no files were written)" % current_sha)
+        return
+
+    backup_path = ensure_backup(asar_path, state_dir, current_sha, source_stat, ext=".asar")
+    print("backup:   %s (sha256 verified)" % backup_path)
+
+    directory = os.path.dirname(asar_path)
+    temp_path = temp_in_dir(directory, ".app-asar-")
+    try:
+        archive.rewrite(temp_path, replacements, source_stat)
+        patched_sha = sha256_file(temp_path)
+        verify_archive = AsarArchive(temp_path)
+        verify_state, _, _ = analyze_asar_zh(verify_archive, engine_js=None)
+        if verify_state != "patched":
+            fail("rewritten app.asar failed post-pack verification")
+        assert_unchanged(asar_path, source_stat, current_sha)
+        os.replace(temp_path, asar_path)
+        fsync_dir(directory)
+    finally:
+        if os.path.exists(temp_path):
+            os.unlink(temp_path)
+
+    final_sha = sha256_file(asar_path)
+    if final_sha != patched_sha:
+        fail("%s: post-write checksum mismatch (%s)" % (asar_path, final_sha))
+
+    manifest_payload = {
+        "schema": 1,
+        "tool": "agy-patch",
+        "target": "desktop-zh",
+        "binary": asar_path,
+        "app_version": summary["app_version"],
+        "binary_size": source_stat.st_size,
+        "original_sha256": current_sha,
+        "patched_sha256": patched_sha,
+        "backup": backup_path,
+        "backup_sha256": current_sha,
+        "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "dict_entries": len(dict_payload["dictionary"]),
+        "native_edits": summary["native_edits"],
+    }
+    atomic_write_json(manifest_path(state_dir, asar_path), manifest_payload)
+    print("sha256:   %s -> %s" % (current_sha, patched_sha))
+    print("patched:  %s" % asar_path)
+    print("manifest: %s" % manifest_path(state_dir, asar_path))
+
+
+# --------------------------------------------------------------------------
+# command dispatchers
+# --------------------------------------------------------------------------
+
+
+def command_status(args):
+    targets = expand_targets(args)
+    desktop_dir = None
+    if "desktop-context" in targets or "desktop-zh" in targets:
+        desktop_dir = resolve_desktop_dir(args.desktop_dir)
+    for idx, t in enumerate(targets):
+        if idx > 0:
+            print("")
+        if t == "cli":
+            path, real = resolve_binary(args.binary, allow_symlink=True)
+            _go_status("cli", path, real, KNOWN_CLI_BUILDS, CLI_PATCH_SPECS)
+        elif t == "desktop-context":
+            ls_path = os.path.join(desktop_dir, "resources", "bin", "language_server")
+            _go_status("desktop-context", ls_path, os.path.realpath(ls_path), KNOWN_LS_BUILDS, LS_PATCH_SPECS)
+        elif t == "desktop-zh":
+            asar_path = os.path.realpath(os.path.join(desktop_dir, "resources", "app.asar"))
+            _zh_status(asar_path)
+    return 0
+
+
+def command_apply(args):
+    targets = expand_targets(args)
+    desktop_dir = None
+    if "desktop-context" in targets or "desktop-zh" in targets:
+        desktop_dir = resolve_desktop_dir(args.desktop_dir)
+    for idx, t in enumerate(targets):
+        if idx > 0:
+            print("")
+        if t == "cli":
+            _path, real = resolve_binary(args.binary, allow_symlink=False)
+            _go_apply("cli", real, KNOWN_CLI_BUILDS, CLI_PATCH_SPECS, args.dry_run)
+        elif t == "desktop-context":
+            ls_path = os.path.realpath(os.path.join(desktop_dir, "resources", "bin", "language_server"))
+            _go_apply("desktop-context", ls_path, KNOWN_LS_BUILDS, LS_PATCH_SPECS, args.dry_run, desktop_dir=desktop_dir)
+        elif t == "desktop-zh":
+            asar_path = os.path.realpath(os.path.join(desktop_dir, "resources", "app.asar"))
+            _zh_apply(desktop_dir, asar_path, args.dry_run)
+    return 0
+
+
+def command_restore(args):
+    targets = expand_targets(args)
+    desktop_dir = None
+    if "desktop-context" in targets or "desktop-zh" in targets:
+        desktop_dir = resolve_desktop_dir(args.desktop_dir)
+    for idx, t in enumerate(targets):
+        if idx > 0:
+            print("")
+        if t == "cli":
+            _path, real = resolve_binary(args.binary, allow_symlink=False)
+            _restore_file_from_manifest("cli", real)
+        elif t == "desktop-context":
+            ls_path = os.path.realpath(os.path.join(desktop_dir, "resources", "bin", "language_server"))
+            _restore_file_from_manifest("desktop-context", ls_path, desktop_dir=desktop_dir)
+        elif t == "desktop-zh":
+            asar_path = os.path.realpath(os.path.join(desktop_dir, "resources", "app.asar"))
+            _restore_file_from_manifest("desktop-zh", asar_path, desktop_dir=desktop_dir)
     return 0
 
 
@@ -1066,26 +1791,43 @@ def command_restore(args):
 # --------------------------------------------------------------------------
 
 
+def _add_common_args(subparser):
+    subparser.add_argument(
+        "--target",
+        choices=["auto", "cli", "desktop-context", "desktop-zh", "desktop", "all"],
+        default="auto",
+        help="target component(s) to operate on (default: auto)",
+    )
+    subparser.add_argument("--binary", help="path to agy CLI binary (default: agy in PATH)")
+    subparser.add_argument(
+        "--desktop-dir",
+        help="path to Antigravity Desktop directory (default: auto-detect)",
+    )
+
+
 def build_parser():
     parser = argparse.ArgumentParser(
         prog="agy-patch",
         description=(
-            "Patch the Antigravity CLI (agy) for 1M-class context windows. "
-            "Reads and rewrites only the agy binary; never touches settings."
+            "Reversible patcher for Antigravity CLI (agy) and Desktop (Linux x86-64): "
+            "1M-class context / no auto-compaction + Simplified Chinese Desktop localization."
         ),
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
-    status = subparsers.add_parser("status", help="show binary and patch state")
-    status.add_argument("--binary", help="path to agy (default: agy in PATH)")
+
+    status = subparsers.add_parser("status", help="show target and patch state")
+    _add_common_args(status)
     status.set_defaults(func=command_status)
-    apply_parser = subparsers.add_parser("apply", help="verify and patch the binary")
-    apply_parser.add_argument("--binary", help="path to agy (default: agy in PATH)")
+
+    apply_parser = subparsers.add_parser("apply", help="verify and patch target(s)")
+    _add_common_args(apply_parser)
     apply_parser.add_argument(
         "--dry-run", action="store_true", help="verify and report without writing"
     )
     apply_parser.set_defaults(func=command_apply)
-    restore = subparsers.add_parser("restore", help="restore the backed-up binary")
-    restore.add_argument("--binary", help="path to agy (default: agy in PATH)")
+
+    restore = subparsers.add_parser("restore", help="restore backed-up original file(s)")
+    _add_common_args(restore)
     restore.set_defaults(func=command_restore)
     return parser
 
